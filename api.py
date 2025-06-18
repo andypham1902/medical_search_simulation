@@ -64,6 +64,7 @@ reranker_tokenizer = None
 metadata_dataset = None
 emb_id_to_metadata_id = {}  # Maps embedding index to metadata row index
 embeddings_matrix = None  # Single concatenated matrix of all embeddings
+url_content_cache = {}  # Cache for URL content to improve /visit performance
 sampling_params = SamplingParams(
     n=1,
     top_k=1,
@@ -100,7 +101,7 @@ def get_embid2metadata_id(dataset):
 @app.on_event("startup")
 async def startup_event():
     """Initialize models and load data on startup"""
-    global embedding_model, reranker_model, reranker_tokenizer, metadata_dataset, emb_id_to_metadata_id, embeddings_matrix
+    global embedding_model, reranker_model, reranker_tokenizer, metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache
 
     start_time = time.time()
     logger.info("Starting model initialization...")
@@ -202,6 +203,38 @@ async def startup_event():
         logger.info("Model initialization completed!")
         if DEBUG_MODE:
             logger.info(f"DEBUG: Total initialization time: {time.time() - start_time:.2f} seconds")
+        
+        # Preload URL content cache
+        cache_start_time = time.time()
+        logger.info("Preloading URL content cache...")
+        cache_count = 0
+        
+        for idx, item in enumerate(metadata_dataset):
+            url = item.get("paper_url")
+            if url:
+                # Get paper title
+                paper_title = item.get("paper_title", "Untitled")
+                
+                # Concatenate all passage texts
+                passage_texts = item.get("passage_text", [])
+                if isinstance(passage_texts, list):
+                    full_content = "\n\n".join(str(text) for text in passage_texts if text)
+                else:
+                    full_content = str(passage_texts) if passage_texts else ""
+                
+                # Combine title and content
+                unified_content = f"# {paper_title}\n\n{full_content}".strip()
+                
+                # Store in cache
+                url_content_cache[url] = unified_content
+                cache_count += 1
+                
+                if DEBUG_MODE and cache_count % 1000 == 0:
+                    logger.info(f"DEBUG: Cached {cache_count} URLs so far...")
+        
+        logger.info(f"URL content cache preloaded with {cache_count} entries in {time.time() - cache_start_time:.2f} seconds")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Average cache entry size: {sum(len(content) for content in url_content_cache.values()) / len(url_content_cache):.0f} chars")
 
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -698,11 +731,12 @@ async def search(request: SearchRequest):
 async def visit(request: VisitRequest):
     """
     Visit a URL and return its content with a realistic response structure.
+    Now uses pre-cached content for improved performance.
     """
     try:
-        if not metadata_dataset:
+        if not url_content_cache:
             return VisitResponse(
-                url=request.url, data="Error: Models not initialized", status_code=500
+                url=request.url, data="Error: Content cache not initialized", status_code=500
             )
 
         url = request.url.strip()
@@ -712,40 +746,17 @@ async def visit(request: VisitRequest):
             )
 
         logger.info(f"Processing visit request for URL: {url}")
-
-        # Find the document in metadata dataset by URL
-        document = None
-        paper_id = None
-        for idx, item in enumerate(metadata_dataset):
-            if item.get("paper_url") == url:
-                document = item
-                paper_id = idx
-                break
-
-        if not document:
-            logger.info(f"Document not found for URL: {url}")
-            return VisitResponse(url=url, data="404 Not Found", status_code=404)
-
-        # Get paper title
-        paper_title = document.get("paper_title", "Untitled")
-
-        # Concatenate all passage texts
-        passage_texts = document.get("passage_text", [])
-        if isinstance(passage_texts, list):
-            # Join all passages with double newline for readability
-            full_content = "\n\n".join(str(text) for text in passage_texts if text)
+        
+        # Check cache first
+        if url in url_content_cache:
+            unified_content = url_content_cache[url]
+            logger.info(
+                f"Successfully returning cached content for URL: {url} (length: {len(unified_content)} chars)"
+            )
+            return VisitResponse(url=url, data=unified_content, status_code=200)
         else:
-            # Handle single passage text
-            full_content = str(passage_texts) if passage_texts else ""
-
-        # Combine title and content
-        unified_content = f"# {paper_title}\n\n{full_content}".strip()
-
-        logger.info(
-            f"Successfully returning content for URL: {url} (length: {len(unified_content)} chars)"
-        )
-
-        return VisitResponse(url=url, data=unified_content, status_code=200)
+            logger.info(f"URL not found in cache: {url}")
+            return VisitResponse(url=url, data="404 Not Found", status_code=404)
 
     except Exception as e:
         logger.error(f"Error in visit endpoint: {e}")
@@ -765,6 +776,11 @@ async def health_check():
             "embeddings_shape": (
                 embeddings_matrix.shape if embeddings_matrix is not None else None
             ),
+        },
+        "cache_statistics": {
+            "url_content_cache_size": len(url_content_cache),
+            "total_cache_memory_mb": sum(len(content) for content in url_content_cache.values()) / (1024 * 1024) if url_content_cache else 0,
+            "cache_initialized": bool(url_content_cache),
         },
     }
 
