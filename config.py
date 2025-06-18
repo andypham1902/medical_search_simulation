@@ -26,6 +26,8 @@ MAX_SEARCH_RESULTS = 20
 TOP_K_RERANK = 10
 EMBEDDING_DIMENSION = 4096  # Adjust based on actual model dimension
 BATCH_SIZE = 1000  # Batch size for GPU processing during search
+USE_GPU_PRELOADING = True  # Enable GPU preloading for better pipeline efficiency
+PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
 
 # File Paths
 EMBEDDING_FOLDER = "embeddings/"
@@ -34,6 +36,7 @@ MAX_EMBEDDING_FILES = 500  # Define correctly number of emb files
 # Logging Configuration
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+DEBUG_MODE = False  # Set to True to enable detailed debug logging
 
 # Environment Variables (with defaults)
 CUDA_VISIBLE_DEVICES = os.getenv("CUDA_VISIBLE_DEVICES", "0")

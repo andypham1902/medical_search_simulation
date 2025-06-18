@@ -11,11 +11,19 @@ import asyncio
 from pathlib import Path
 import logging
 import config
+import time
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from queue import Queue
 
 
 # Configure logging
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL), format=config.LOG_FORMAT)
 logger = logging.getLogger(__name__)
+
+# Debug mode flag
+DEBUG_MODE = config.DEBUG_MODE
 
 
 # Pydantic models for API
@@ -95,11 +103,17 @@ async def startup_event():
     """Initialize models and load data on startup"""
     global embedding_model, reranker_model, reranker_tokenizer, metadata_dataset, emb_id_to_paper_id, embeddings_matrix
 
+    start_time = time.time()
     logger.info("Starting model initialization...")
+    if DEBUG_MODE:
+        logger.info("DEBUG MODE ENABLED - Detailed logging active")
 
     try:
         # Initialize VLLM models
+        model_start_time = time.time()
         logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL_NAME}")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Model config - tensor_parallel_size={config.TENSOR_PARALLEL_SIZE}, gpu_memory_utilization={config.GPU_MEMORY_UTILIZATION}")
         embedding_model = LLM(
             model=config.EMBEDDING_MODEL_NAME,
             trust_remote_code=config.TRUST_REMOTE_CODE,
@@ -107,8 +121,13 @@ async def startup_event():
             gpu_memory_utilization=config.GPU_MEMORY_UTILIZATION,
             task="embed",
         )
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Embedding model loaded in {time.time() - model_start_time:.2f} seconds")
 
+        reranker_start_time = time.time()
         logger.info(f"Loading reranker model: {config.RERANKER_MODEL_NAME}")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Reranker config - max_model_len={config.MAX_MODEL_LEN}")
         reranker_model = LLM(
             model=config.RERANKER_MODEL_NAME,
             trust_remote_code=config.TRUST_REMOTE_CODE,
@@ -117,28 +136,42 @@ async def startup_event():
             max_model_len=config.MAX_MODEL_LEN,
         )
         reranker_tokenizer = reranker_model.get_tokenizer()
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Reranker model loaded in {time.time() - reranker_start_time:.2f} seconds")
 
         # Load metadata dataset
+        metadata_start_time = time.time()
         logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME}")
         metadata_dataset = load_dataset(config.METADATA_DATASET_NAME, split="train")
         emb_id_to_paper_id = get_embid2paperid(metadata_dataset)
         logger.info(f"Loaded {len(metadata_dataset)} metadata records")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Metadata loaded in {time.time() - metadata_start_time:.2f} seconds")
+            logger.info(f"DEBUG: Total embedding ID to paper ID mappings: {len(emb_id_to_paper_id)}")
 
         # Load embedding files sequentially (embeddings_0.pt to embeddings_500.pt)
+        embeddings_start_time = time.time()
         logger.info("Loading embedding files sequentially...")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Loading {config.MAX_EMBEDDING_FILES} embedding files from {config.EMBEDDING_FOLDER}")
         embedding_tensors = []
 
         for i in range(config.MAX_EMBEDDING_FILES):
             file_path = f"{config.EMBEDDING_FOLDER}/embeddings_{i}.pt"
             try:
                 # Load embeddings to CPU memory to avoid GPU memory usage during startup
+                file_load_start = time.time()
                 embeddings = torch.load(file_path, map_location="cpu")
                 # Ensure embeddings is 2D (add batch dimension if needed)
                 if embeddings.dim() == 1:
                     embeddings = embeddings.unsqueeze(0)
                 embedding_tensors.extend(embeddings)
 
-                if i % 50 == 0:
+                if DEBUG_MODE and i % 10 == 0:
+                    logger.info(
+                        f"DEBUG: Loaded embeddings_{i}.pt in {time.time() - file_load_start:.3f}s - Shape: {embeddings.shape} ({i+1}/{config.MAX_EMBEDDING_FILES})"
+                    )
+                elif i % 50 == 0:
                     logger.info(
                         f"Loaded embeddings_{i}.pt ({i+1}/{config.MAX_EMBEDDING_FILES})"
                     )
@@ -159,7 +192,12 @@ async def startup_event():
         else:
             logger.error("No embedding files were loaded successfully")
             raise Exception("Failed to load any embedding files")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: All embeddings loaded in {time.time() - embeddings_start_time:.2f} seconds")
+        
         logger.info("Model initialization completed!")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Total initialization time: {time.time() - start_time:.2f} seconds")
 
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -179,30 +217,170 @@ def compute_similarity(
     return similarities
 
 
+def search_embeddings_batch_optimized(
+    query_embedding: torch.Tensor, batch_size: int = 1000, top_k: int = None
+) -> List[tuple]:
+    """Optimized search with GPU preloading for better pipeline efficiency"""
+    all_scores = []
+    search_start_time = time.time()
+    if DEBUG_MODE:
+        logger.info(f"DEBUG: Starting OPTIMIZED embedding search with batch_size={batch_size}, top_k={top_k}")
+
+    try:
+        # Create CUDA streams for overlapping computation and data transfer
+        main_stream = torch.cuda.Stream()
+        prefetch_stream = torch.cuda.Stream()
+        
+        # Ensure query embedding is on GPU
+        with torch.cuda.stream(main_stream):
+            gpu_transfer_start = time.time()
+            query_embedding_gpu = query_embedding.cuda()
+            if DEBUG_MODE:
+                logger.info(f"DEBUG: Query embedding transferred to GPU in {time.time() - gpu_transfer_start:.4f} seconds")
+        
+        # Process the single embeddings matrix in batches
+        num_embeddings = embeddings_matrix.shape[0]
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Total embeddings to search: {num_embeddings}")
+
+        # Preload first batch
+        current_batch_gpu = None
+        next_batch_gpu = None
+        
+        for i in range(0, num_embeddings, batch_size):
+            batch_start_time = time.time()
+            end_idx = min(i + batch_size, num_embeddings)
+            
+            try:
+                with torch.cuda.stream(main_stream):
+                    # Use preloaded batch or load first batch
+                    if next_batch_gpu is not None:
+                        # Wait for prefetch to complete
+                        prefetch_stream.synchronize()
+                        batch_embeddings = next_batch_gpu
+                        if DEBUG_MODE:
+                            logger.info(f"DEBUG: Using preloaded batch {i//batch_size}")
+                    else:
+                        gpu_load_start = time.time()
+                        batch_embeddings = embeddings_matrix[i:end_idx].cuda()
+                        gpu_load_time = time.time() - gpu_load_start
+                        if DEBUG_MODE:
+                            logger.info(f"DEBUG: First batch {i//batch_size} loaded to GPU in {gpu_load_time:.4f}s")
+                    
+                    # Compute similarities
+                    compute_start = time.time()
+                    batch_scores = compute_similarity(query_embedding_gpu, batch_embeddings)
+                    compute_time = time.time() - compute_start
+                    
+                    # Store results (move back to CPU to save GPU memory)
+                    cpu_transfer_start = time.time()
+                    all_scores.append(batch_scores.cpu())
+                    cpu_transfer_time = time.time() - cpu_transfer_start
+                
+                # Start loading next batch in parallel using prefetch stream
+                with torch.cuda.stream(prefetch_stream):
+                    next_i = i + batch_size
+                    if next_i < num_embeddings:
+                        next_end_idx = min(next_i + batch_size, num_embeddings)
+                        # Use non_blocking=True for asynchronous transfer
+                        prefetch_start = time.time()
+                        next_batch_gpu = embeddings_matrix[next_i:next_end_idx].cuda(non_blocking=True)
+                        if DEBUG_MODE and (i == 0 or (i // batch_size) % 10 == 0):
+                            logger.info(f"DEBUG: Started preloading batch {next_i//batch_size} (async)")
+                    else:
+                        next_batch_gpu = None
+                
+                if DEBUG_MODE and (i == 0 or (i // batch_size) % 10 == 0):
+                    logger.info(f"DEBUG: Batch {i//batch_size}: compute: {compute_time:.4f}s, CPU transfer: {cpu_transfer_time:.4f}s, total: {time.time() - batch_start_time:.4f}s")
+                
+            except Exception as e:
+                logger.error(f"Error processing batch {i}-{end_idx}: {e}")
+            finally:
+                # Clean up current batch
+                if batch_embeddings is not None and i > 0:
+                    del batch_embeddings
+                torch.cuda.empty_cache()
+        
+        # Clean up any remaining preloaded batch
+        if next_batch_gpu is not None:
+            del next_batch_gpu
+            torch.cuda.empty_cache()
+        
+        # Combine all scores and get top-k
+        if all_scores:
+            all_scores_tensor = torch.cat(all_scores)
+            if top_k is None:
+                top_k = config.MAX_SEARCH_RESULTS * 2
+            top_k = min(top_k, len(all_scores_tensor))
+            top_scores, top_indices = torch.topk(all_scores_tensor, top_k)
+            
+            results = []
+            for score, idx in zip(top_scores, top_indices):
+                results.append((idx.item(), score.item()))
+            
+            if DEBUG_MODE:
+                logger.info(f"DEBUG: Optimized embedding search completed in {time.time() - search_start_time:.2f} seconds")
+                logger.info(f"DEBUG: Returning {len(results)} results")
+            return results
+            
+    except Exception as e:
+        logger.error(f"Error in search_embeddings_batch_optimized: {e}")
+    finally:
+        if "query_embedding_gpu" in locals():
+            del query_embedding_gpu
+        torch.cuda.empty_cache()
+    
+    return []
+
+
 def search_embeddings_batch(
     query_embedding: torch.Tensor, batch_size: int = 1000, top_k: int = None
 ) -> List[tuple]:
     """Search through embeddings in batches, loading to GPU only when needed"""
+    # Use optimized version if enabled
+    if config.USE_GPU_PRELOADING:
+        return search_embeddings_batch_optimized(query_embedding, batch_size, top_k)
+    
+    # Original implementation
     all_scores = []
+    search_start_time = time.time()
+    if DEBUG_MODE:
+        logger.info(f"DEBUG: Starting embedding search with batch_size={batch_size}, top_k={top_k}")
 
     try:
         # Ensure query embedding is on GPU
+        gpu_transfer_start = time.time()
         query_embedding_gpu = query_embedding.cuda()
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Query embedding transferred to GPU in {time.time() - gpu_transfer_start:.4f} seconds")
+        
         # Process the single embeddings matrix in batches
         num_embeddings = embeddings_matrix.shape[0]
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Total embeddings to search: {num_embeddings}")
 
         for i in range(0, num_embeddings, batch_size):
+            batch_start_time = time.time()
             end_idx = min(i + batch_size, num_embeddings)
 
             try:
                 # Load batch to GPU
+                gpu_load_start = time.time()
                 batch_embeddings = embeddings_matrix[i:end_idx].cuda()
+                gpu_load_time = time.time() - gpu_load_start
 
                 # Compute similarities
+                compute_start = time.time()
                 batch_scores = compute_similarity(query_embedding_gpu, batch_embeddings)
+                compute_time = time.time() - compute_start
 
                 # Store results (move back to CPU to save GPU memory)
+                cpu_transfer_start = time.time()
                 all_scores.append(batch_scores.cpu())
+                cpu_transfer_time = time.time() - cpu_transfer_start
+                
+                if DEBUG_MODE and (i == 0 or (i // batch_size) % 10 == 0):
+                    logger.info(f"DEBUG: Batch {i//batch_size}: GPU load: {gpu_load_time:.4f}s, compute: {compute_time:.4f}s, CPU transfer: {cpu_transfer_time:.4f}s, total: {time.time() - batch_start_time:.4f}s")
 
             except Exception as e:
                 logger.error(f"Error processing batch {i}-{end_idx}: {e}")
@@ -225,6 +403,9 @@ def search_embeddings_batch(
             for score, idx in zip(top_scores, top_indices):
                 results.append((idx.item(), score.item()))
 
+            if DEBUG_MODE:
+                logger.info(f"DEBUG: Embedding search completed in {time.time() - search_start_time:.2f} seconds")
+                logger.info(f"DEBUG: Returning {len(results)} results")
             return results
 
     except Exception as e:
@@ -245,6 +426,7 @@ def get_detailed_instruct(task_description: str, query: str) -> str:
 def get_query_embedding(query: str) -> torch.Tensor:
     """Get embedding for a query using the embedding model"""
     try:
+        start_time = time.time()
         # Generate embedding using the model
         # Note: Adjust this based on the actual API of Qwen3-Embedding-8B
         task = (
@@ -252,7 +434,11 @@ def get_query_embedding(query: str) -> torch.Tensor:
         )
         outputs = embedding_model.embed([get_detailed_instruct(task, query)])
         embedding = torch.tensor(outputs[0].outputs.embedding)
-        logger.debug(f"Generated embedding for query: {query[:50]}...")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Query embedding generated in {time.time() - start_time:.3f} seconds")
+            logger.info(f"DEBUG: Query: '{query[:100]}...' -> Embedding shape: {embedding.shape}")
+        else:
+            logger.debug(f"Generated embedding for query: {query[:50]}...")
         return embedding
     except Exception as e:
         logger.error(f"Error generating query embedding: {e}")
@@ -313,14 +499,21 @@ def softmax(x, temp=1.0):
 def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[tuple]:
     """Rerank search results using the reranker model"""
     global reranker_model, reranker_tokenizer, sampling_params
+    rerank_start_time = time.time()
+    
     yes_token = reranker_tokenizer("yes", return_tensors="pt").input_ids[0, 0].item()
     no_token = reranker_tokenizer("no", return_tensors="pt").input_ids[0, 0].item()
     if top_k is None:
         top_k = config.TOP_K_RERANK
+    
+    if DEBUG_MODE:
+        logger.info(f"DEBUG: Starting reranking for {len(results)} results, selecting top {top_k}")
+    
     try:
         # Prepare input for reranker
+        prep_start_time = time.time()
         rerank_inputs = []
-        for passage_id, score in results:
+        for idx, (passage_id, score) in enumerate(results):
             # Create query-document pairs for reranking
             instruction = "Given a web search query, retrieve relevant passages that answer the query"
             doc_text = get_passage_text(
@@ -329,9 +522,19 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
             rerank_inputs.append(
                 format_reranker_input(format_instruction(instruction, query, doc_text))
             )
+            if DEBUG_MODE and idx == 0:
+                logger.info(f"DEBUG: Sample reranker input length: {len(rerank_inputs[0])} chars")
+        
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Prepared {len(rerank_inputs)} inputs for reranking in {time.time() - prep_start_time:.3f} seconds")
 
         # Get reranking scores
+        generate_start_time = time.time()
         outputs = reranker_model.generate(rerank_inputs, sampling_params)
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Reranker generation completed in {time.time() - generate_start_time:.3f} seconds")
+        
+        score_calc_start = time.time()
         rerank_scores = []
         for output in outputs:
             logprobs = [
@@ -350,8 +553,15 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
             combined_score = rerank_score
             new_results.append((passage_id, combined_score))
 
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Score calculation completed in {time.time() - score_calc_start:.3f} seconds")
+        
         # Sort by score and return top_k
         reranked = sorted(new_results, key=lambda x: x[1] or 0, reverse=True)
+        
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Total reranking time: {time.time() - rerank_start_time:.3f} seconds")
+            logger.info(f"DEBUG: Top 3 reranked scores: {[score for _, score in reranked[:3]]}")
         logger.debug(f"Reranked {len(results)} results, returning top {top_k}")
         return reranked[:top_k]
 
@@ -373,6 +583,7 @@ async def search(request: SearchRequest):
         A list of URLs with metadata, optionally reranked for relevance.
     """
     try:
+        search_start_time = time.time()
         if not metadata_dataset:
             raise HTTPException(status_code=500, detail="Models not initialized")
 
@@ -381,9 +592,14 @@ async def search(request: SearchRequest):
             raise HTTPException(status_code=400, detail="Query cannot be empty")
 
         logger.info(f"Processing search query: {query}")
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Search request - use_reranker={request.use_reranker}")
 
         # Get query embedding
+        embed_start = time.time()
         query_embedding = get_query_embedding(query)
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Query embedding obtained in {time.time() - embed_start:.3f} seconds")
 
         # Search through embeddings to find similar documents
         logger.info("Searching through embeddings...")
@@ -393,16 +609,23 @@ async def search(request: SearchRequest):
             if request.use_reranker
             else config.MAX_SEARCH_RESULTS * 2
         )
+        
+        search_start = time.time()
         top_matches = search_embeddings_batch(
             query_embedding,
             batch_size=getattr(config, "BATCH_SIZE", 1000),
             top_k=num_candidates,
         )
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Embedding search completed in {time.time() - search_start:.3f} seconds, found {len(top_matches)} matches")
 
         # Apply reranking if requested
         if request.use_reranker:
             logger.info(f"Applying reranking to {len(top_matches)} passage results")
+            rerank_start = time.time()
             top_matches = rerank_results(query, top_matches)
+            if DEBUG_MODE:
+                logger.info(f"DEBUG: Reranking completed in {time.time() - rerank_start:.3f} seconds")
         else:
             logger.info(f"Skipping reranking, using embedding similarity scores")
 
@@ -454,6 +677,10 @@ async def search(request: SearchRequest):
         logger.info(
             f"Returning {len(search_results)} search results for query: {query}"
         )
+        
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Total search time: {time.time() - search_start_time:.3f} seconds")
+            logger.info(f"DEBUG: Breakdown - embedding: {embed_start:.3f}s, search: {search_start:.3f}s, total: {time.time() - search_start_time:.3f}s")
 
         return SearchResponse(results=search_results)
 
@@ -553,5 +780,35 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(app, host=config.API_HOST, port=config.API_PORT)
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Medical Search Simulation API")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with detailed logging"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=config.API_HOST,
+        help="Host to bind the API server"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=config.API_PORT,
+        help="Port to bind the API server"
+    )
+    args = parser.parse_args()
+    
+    # Set debug mode
+    if args.debug:
+        DEBUG_MODE = True
+        config.DEBUG_MODE = True
+        # Update logging level to DEBUG
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        print("\n*** DEBUG MODE ENABLED - Detailed logging active ***\n")
+    
+    uvicorn.run(app, host=args.host, port=args.port)

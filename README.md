@@ -20,6 +20,7 @@ The system uses a two-stage retrieval pipeline:
 ### Key Optimizations
 - CPU memory caching for all embeddings
 - GPU batch processing during search operations
+- **GPU preloading**: Next batch loads while current batch processes (using CUDA streams)
 - Automatic GPU memory cleanup after each request
 - Efficient deduplication by paper ID
 
@@ -47,6 +48,26 @@ python api.py
 ```
 
 The server will start on `http://0.0.0.0:8000` by default.
+
+### Debug Mode
+
+To run the server with detailed debug logging:
+```bash
+python api.py --debug
+```
+
+This will enable comprehensive logging including:
+- Model loading times
+- Embedding batch processing times (CPU to GPU transfer)
+- Query embedding generation time
+- Similarity computation time per batch
+- Reranking preparation and scoring times
+- Total API response time breakdowns
+
+Additional command line options:
+```bash
+python api.py --debug --host 0.0.0.0 --port 8080
+```
 
 ## API Endpoints
 
@@ -158,6 +179,8 @@ MAX_SEARCH_RESULTS = 20      # Maximum results to return
 TOP_K_RERANK = 10           # Results after reranking
 EMBEDDING_DIMENSION = 4096   # Embedding vector dimension
 BATCH_SIZE = 1000           # GPU batch size
+USE_GPU_PRELOADING = True   # Enable GPU preloading optimization
+PRELOAD_BUFFER_SIZE = 2     # Number of batches to keep in GPU buffer
 ```
 
 ### GPU Settings
@@ -173,6 +196,13 @@ EMBEDDING_FOLDER = "embeddings/"
 MAX_EMBEDDING_FILES = 500
 ```
 
+### Debug Configuration
+```python
+DEBUG_MODE = False           # Set to True for detailed logging
+LOG_LEVEL = "INFO"          # Default log level
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+```
+
 ## Performance Considerations
 
 ### Memory Requirements
@@ -184,6 +214,10 @@ MAX_EMBEDDING_FILES = 500
 2. Increase `GPU_MEMORY_UTILIZATION` if you have dedicated GPU
 3. Use `use_reranker=false` for faster but less accurate results
 4. Monitor GPU memory usage during peak loads
+5. Enable debug mode to identify performance bottlenecks
+6. Watch embedding batch processing times to optimize `BATCH_SIZE`
+7. Set `USE_GPU_PRELOADING=True` for better pipeline efficiency (enabled by default)
+8. The GPU preloading feature overlaps data transfer with computation using CUDA streams
 
 ## Testing
 
