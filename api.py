@@ -62,7 +62,7 @@ embedding_model = None
 reranker_model = None
 reranker_tokenizer = None
 metadata_dataset = None
-emb_id_to_paper_id = {}  # Maps embedding index to paper_id
+emb_id_to_metadata_id = {}  # Maps embedding index to metadata row index
 embeddings_matrix = None  # Single concatenated matrix of all embeddings
 sampling_params = SamplingParams(
     n=1,
@@ -70,38 +70,37 @@ sampling_params = SamplingParams(
     temperature=0.0,
     skip_special_tokens=False,
     max_tokens=1,
-    logprobs=1024,
+    logprobs=config.MAX_LOGPROBS,
 )
 
 
-def get_embid2paperid(dataset):
+def get_embid2metadata_id(dataset):
     """
-    Create a dictionary mapping passage_id to paper_id from a dataset
-    where passage_ids is a list column and paper_id is an int column.
+    Create a dictionary mapping passage_id to metadata row index from a dataset
+    where passage_id is a list column.
 
     Args:
-        dataset: Dataset object with 'passage_ids' (list) and 'paper_id' (int) columns
+        dataset: Dataset object with 'passage_id' (list) column
 
     Returns:
-        dict: Dictionary mapping passage_id -> paper_id
+        dict: Dictionary mapping passage_id -> metadata row index
     """
-    passage_id_to_paper_id = {}
+    passage_id_to_metadata_id = {}
 
-    for row in dataset:
-        paper_id = row["paper_id"]
-        passage_ids = row["passage_ids"]  # This is a list
+    for idx, row in enumerate(dataset):
+        passage_ids = row["passage_id"]  # This is a list
 
-        # Map each passage_id in the list to the paper_id
+        # Map each passage_id in the list to the metadata row index
         for passage_id in passage_ids:
-            passage_id_to_paper_id[passage_id] = paper_id
+            passage_id_to_metadata_id[passage_id] = idx
 
-    return passage_id_to_paper_id
+    return passage_id_to_metadata_id
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize models and load data on startup"""
-    global embedding_model, reranker_model, reranker_tokenizer, metadata_dataset, emb_id_to_paper_id, embeddings_matrix
+    global embedding_model, reranker_model, reranker_tokenizer, metadata_dataset, emb_id_to_metadata_id, embeddings_matrix
 
     start_time = time.time()
     logger.info("Starting model initialization...")
@@ -118,7 +117,7 @@ async def startup_event():
             model=config.EMBEDDING_MODEL_NAME,
             trust_remote_code=config.TRUST_REMOTE_CODE,
             tensor_parallel_size=config.TENSOR_PARALLEL_SIZE,
-            gpu_memory_utilization=config.GPU_MEMORY_UTILIZATION,
+            gpu_memory_utilization=config.GPU_MEMORY_UTILIZATION / 2,
             task="embed",
         )
         if DEBUG_MODE:
@@ -132,8 +131,13 @@ async def startup_event():
             model=config.RERANKER_MODEL_NAME,
             trust_remote_code=config.TRUST_REMOTE_CODE,
             tensor_parallel_size=config.TENSOR_PARALLEL_SIZE,
-            gpu_memory_utilization=config.GPU_MEMORY_UTILIZATION,
+            gpu_memory_utilization=config.GPU_MEMORY_UTILIZATION * 2,
             max_model_len=config.MAX_MODEL_LEN,
+            max_num_seqs=config.RERANK_BATCH_SIZE,
+            enable_prefix_caching=True,
+            enforce_eager=True,
+            disable_log_stats=True,
+            max_logprobs=config.MAX_LOGPROBS,
         )
         reranker_tokenizer = reranker_model.get_tokenizer()
         if DEBUG_MODE:
@@ -143,11 +147,11 @@ async def startup_event():
         metadata_start_time = time.time()
         logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME}")
         metadata_dataset = load_dataset(config.METADATA_DATASET_NAME, split="train")
-        emb_id_to_paper_id = get_embid2paperid(metadata_dataset)
+        emb_id_to_metadata_id = get_embid2metadata_id(metadata_dataset)
         logger.info(f"Loaded {len(metadata_dataset)} metadata records")
         if DEBUG_MODE:
             logger.info(f"DEBUG: Metadata loaded in {time.time() - metadata_start_time:.2f} seconds")
-            logger.info(f"DEBUG: Total embedding ID to paper ID mappings: {len(emb_id_to_paper_id)}")
+            logger.info(f"DEBUG: Total embedding ID to metadata ID mappings: {len(emb_id_to_metadata_id)}")
 
         # Load embedding files sequentially (embeddings_0.pt to embeddings_500.pt)
         embeddings_start_time = time.time()
@@ -458,8 +462,8 @@ def get_passage_text(passage_id: int) -> str:
     global metadata_dataset
     if not metadata_dataset:
         raise ValueError("Metadata dataset is not loaded")
-    paper_id = emb_id_to_paper_id.get(passage_id)
-    item = metadata_dataset[paper_id]
+    metadata_id = emb_id_to_metadata_id.get(passage_id)
+    item = metadata_dataset[metadata_id]
     passage_text = ""
     for pid, text in zip(item.get("passage_id", []), item.get("passage_text", [])):
         if pid == passage_id:
@@ -475,7 +479,7 @@ def format_reranker_input(text: str) -> str:
     messages = [
         {
             "role": "system",
-            "content": 'Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no"',
+            "content": 'Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be yes or no',
         },
         {"role": "user", "content": f"{text}"},
         {"role": "assistant", "content": ""},
@@ -508,7 +512,6 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
     
     if DEBUG_MODE:
         logger.info(f"DEBUG: Starting reranking for {len(results)} results, selecting top {top_k}")
-    
     try:
         # Prepare input for reranker
         prep_start_time = time.time()
@@ -605,7 +608,7 @@ async def search(request: SearchRequest):
         logger.info("Searching through embeddings...")
         # Get more candidates if using reranker to account for deduplication
         num_candidates = (
-            config.MAX_SEARCH_RESULTS * 4
+            config.MAX_SEARCH_RESULTS * 20
             if request.use_reranker
             else config.MAX_SEARCH_RESULTS * 2
         )
@@ -636,8 +639,10 @@ async def search(request: SearchRequest):
         paper_best_matches = {}  # paper_id -> (passage_idx, score)
 
         for idx, score in top_matches:
-            paper_id = emb_id_to_paper_id.get(idx)
-            if paper_id is not None:
+            metadata_id = emb_id_to_metadata_id.get(idx)
+            if metadata_id is not None:
+                item = metadata_dataset[metadata_id]
+                paper_id = item.get("paper_id")
                 # Keep the highest scoring passage for each paper
                 if (
                     paper_id not in paper_best_matches
@@ -654,9 +659,9 @@ async def search(request: SearchRequest):
         # Get metadata for deduplicated matches
         search_results = []
         for idx, score in deduplicated_matches[: config.MAX_SEARCH_RESULTS]:
-            paper_id = emb_id_to_paper_id.get(idx)
-            if paper_id is not None and paper_id < len(metadata_dataset):
-                item = metadata_dataset[paper_id]
+            metadata_id = emb_id_to_metadata_id.get(idx)
+            if metadata_id is not None and metadata_id < len(metadata_dataset):
+                item = metadata_dataset[metadata_id]
 
                 result = SearchResult(
                     url=item.get("paper_url", f"https://example.com/paper_{paper_id}"),
@@ -680,7 +685,7 @@ async def search(request: SearchRequest):
         
         if DEBUG_MODE:
             logger.info(f"DEBUG: Total search time: {time.time() - search_start_time:.3f} seconds")
-            logger.info(f"DEBUG: Breakdown - embedding: {embed_start:.3f}s, search: {search_start:.3f}s, total: {time.time() - search_start_time:.3f}s")
+            logger.info(f"DEBUG: Breakdown - embedding: {time.time() - embed_start:.3f}s, search: {time.time() - search_start:.3f}s, total: {time.time() - search_start_time:.3f}s")
 
         return SearchResponse(results=search_results)
 

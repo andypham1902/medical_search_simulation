@@ -25,13 +25,17 @@ API_VERSION = "1.0.0"
 MAX_SEARCH_RESULTS = 20
 TOP_K_RERANK = 10
 EMBEDDING_DIMENSION = 4096  # Adjust based on actual model dimension
-BATCH_SIZE = 1000  # Batch size for GPU processing during search
+BATCH_SIZE = 65536  # Batch size for GPU processing during search
 USE_GPU_PRELOADING = True  # Enable GPU preloading for better pipeline efficiency
 PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
 
+# Reranker Configuration
+MAX_LOGPROBS = 8192  # Maximum number of log probabilities to return
+RERANK_BATCH_SIZE = 512  # Batch size for reranking
+
 # File Paths
-EMBEDDING_FOLDER = "embeddings/"
-MAX_EMBEDDING_FILES = 500  # Define correctly number of emb files
+EMBEDDING_FOLDER = "/mnt/sharefs/tuenv/embeddings/Miriad_Embedding/"
+MAX_EMBEDDING_FILES = 282  # Define correctly number of emb files
 
 # Logging Configuration
 LOG_LEVEL = "INFO"

@@ -7,7 +7,7 @@ import requests
 import json
 import time
 
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "http://192.168.0.11:8000"
 
 
 def test_health_check():
@@ -94,19 +94,16 @@ def test_visit():
 
                 if visit_response.status_code == 200:
                     visit_data = visit_response.json()
-                    passages_count = len(visit_data.get("passages", []))
-                    print(f"   ✅ Found {passages_count} passages")
+                    passages_count = len(visit_data.get("data", "").split())
+                    print(f"   ✅ Found {passages_count} words")
 
                     # Show first passage if available
                     if passages_count > 0:
-                        first_passage = visit_data["passages"][0]
-                        passage_preview = (
-                            first_passage.get("passage_text", "")[:100] + "..."
-                        )
-                        print(f"      First passage preview: {passage_preview}")
+                        first_passage = visit_data["data"][0]
+                        print(f"      First passage preview: {first_passage[:100]}...")
                 else:
                     print(
-                        f"   ❌ Visit failed: {visit_response.status_code} - {visit_response.text}"
+                        f"   ❌ Visit failed: {visit_response.status_code} - {visit_response.url}"
                     )
             else:
                 print("   ⚠️  No search results to test visit with")

@@ -32,6 +32,10 @@ pip install -r requirements.txt
 ```
 
 2. Prepare embeddings:
+   - Get embeddings:
+    ```bash
+      git clone https://huggingface.co/datasets/hoanganhpham/Miriad_Embedding
+    ```
    - Place embedding files in the `embeddings/` folder
    - Files should be named `embeddings_0.pt` to `embeddings_499.pt`
    - Each file contains embeddings for document passages
@@ -48,6 +52,29 @@ python api.py
 ```
 
 The server will start on `http://0.0.0.0:8000` by default.
+
+## Quick Test
+
+Once the server is running, you can test it with these curl commands:
+
+1. **Check if the API is healthy:**
+```bash
+curl http://localhost:8000/health
+```
+
+2. **Search for medical documents:**
+```bash
+curl -X POST "http://localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "diabetes treatment", "use_reranker": true}'
+```
+
+3. **Visit a specific document** (replace URL with one from search results):
+```bash
+curl -X POST "http://localhost:8000/visit" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/paper_123"}'
+```
 
 ### Debug Mode
 
@@ -77,7 +104,7 @@ python api.py --debug --host 0.0.0.0 --port 8080
 POST /search
 ```
 
-Request body:
+**Request body:**
 ```json
 {
     "query": "diabetes treatment guidelines",
@@ -85,11 +112,31 @@ Request body:
 }
 ```
 
-Parameters:
+**Parameters:**
 - `query` (required): Search query text
 - `use_reranker` (optional): Whether to apply reranking (default: true)
 
-Response:
+**Example curl command:**
+```bash
+curl -X POST "http://localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "diabetes treatment guidelines",
+    "use_reranker": true
+  }'
+```
+
+**Example without reranking:**
+```bash
+curl -X POST "http://localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "cardiovascular risk factors",
+    "use_reranker": false
+  }'
+```
+
+**Response:**
 ```json
 {
   "results": [
@@ -114,14 +161,23 @@ Response:
 POST /visit
 ```
 
-Request body:
+**Request body:**
 ```json
 {
     "url": "https://example.com/paper_123"
 }
 ```
 
-Response:
+**Example curl command:**
+```bash
+curl -X POST "http://localhost:8000/visit" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/paper_123"
+  }'
+```
+
+**Response:**
 ```json
 {
   "url": "https://example.com/paper_123",
@@ -130,7 +186,7 @@ Response:
 }
 ```
 
-Status codes:
+**Status codes:**
 - 200: Success
 - 404: Document not found
 - 400: Invalid request
@@ -142,7 +198,12 @@ Status codes:
 GET /health
 ```
 
-Response:
+**Example curl command:**
+```bash
+curl -X GET "http://localhost:8000/health"
+```
+
+**Response:**
 ```json
 {
   "status": "healthy",
