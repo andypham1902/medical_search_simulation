@@ -17,7 +17,7 @@ TRUST_REMOTE_CODE = True
 
 # API Configuration
 API_HOST = "0.0.0.0"
-API_PORT = 8000
+API_PORT = 10000
 API_TITLE = "Medical Search Simulation API"
 API_VERSION = "1.0.0"
 
@@ -54,3 +54,19 @@ MODEL_LOADING_TIMEOUT = 600  # 10 minutes
 REQUEST_TIMEOUT = 30  # seconds
 SEARCH_TIMEOUT = 60  # seconds
 VISIT_TIMEOUT = 30  # seconds
+
+# Server Configuration for separate model servers
+EMBEDDING_SERVER_HOST = "127.0.0.1"
+EMBEDDING_SERVER_PORT = 10001
+RERANKER_SERVER_HOST = "127.0.0.1"
+RERANKER_SERVER_PORT = 10002
+
+# GPU allocation for separate servers
+EMBEDDING_GPU_DEVICES = "0"  # GPU device(s) for embedding server
+RERANK_GPU_DEVICES = "1,2,3,4"  # GPU device(s) for reranker server
+
+# Model server specific configurations
+EMBEDDING_TENSOR_PARALLEL_SIZE = 1
+EMBEDDING_GPU_MEMORY_UTILIZATION = 0.4
+RERANK_TENSOR_PARALLEL_SIZE = 4
+RERANK_GPU_MEMORY_UTILIZATION = 0.8

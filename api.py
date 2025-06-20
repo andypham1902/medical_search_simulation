@@ -6,7 +6,6 @@ import numpy as np
 from datasets import load_dataset
 import os
 import glob
-from vllm import LLM, SamplingParams
 import asyncio
 from pathlib import Path
 import logging
@@ -16,6 +15,11 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from queue import Queue
+import subprocess
+import requests
+import signal
+import atexit
+import sys
 
 
 # Configure logging
@@ -65,14 +69,94 @@ metadata_dataset = None
 emb_id_to_metadata_id = {}  # Maps embedding index to metadata row index
 embeddings_matrix = None  # Single concatenated matrix of all embeddings
 url_content_cache = {}  # Cache for URL content to improve /visit performance
-sampling_params = SamplingParams(
-    n=1,
-    top_k=1,
-    temperature=0.0,
-    skip_special_tokens=False,
-    max_tokens=1,
-    logprobs=config.MAX_LOGPROBS,
-)
+sampling_params = None  # Will be initialized based on server mode
+
+# Server process references
+embedding_server_process = None
+reranker_server_process = None
+
+
+def start_model_servers():
+    """Start embedding and reranker servers as subprocesses"""
+    global embedding_server_process, reranker_server_process
+    
+    logger.info("Starting model servers...")
+    
+    # Start embedding server
+    embedding_cmd = [
+        sys.executable,
+        "embedding_server.py",
+        "--port", str(config.EMBEDDING_SERVER_PORT),
+        "--host", config.EMBEDDING_SERVER_HOST
+    ]
+    logger.info(f"Starting embedding server: {' '.join(embedding_cmd)}")
+    embedding_server_process = subprocess.Popen(
+        embedding_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": config.EMBEDDING_GPU_DEVICES}
+    )
+    
+    # Start reranker server
+    reranker_cmd = [
+        sys.executable,
+        "reranker_server.py",
+        "--port", str(config.RERANKER_SERVER_PORT),
+        "--host", config.RERANKER_SERVER_HOST
+    ]
+    logger.info(f"Starting reranker server: {' '.join(reranker_cmd)}")
+    reranker_server_process = subprocess.Popen(
+        reranker_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
+    )
+    
+    # Wait for servers to be ready
+    embedding_url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health"
+    reranker_url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/health"
+    
+    max_retries = config.MODEL_LOADING_TIMEOUT  # 60 seconds timeout
+    for i in range(max_retries):
+        time.sleep(1)
+        try:
+            # Check embedding server
+            embed_resp = requests.get(embedding_url, timeout=1)
+            embed_ready = embed_resp.status_code == 200
+            
+            # Check reranker server
+            rerank_resp = requests.get(reranker_url, timeout=1)
+            rerank_ready = rerank_resp.status_code == 200
+            
+            if embed_ready and rerank_ready:
+                logger.info("Both model servers are ready!")
+                return True
+                
+        except requests.exceptions.RequestException:
+            if i % 60 == 0:
+                logger.info(f"Waiting for servers to start... ({i}s)")
+            continue
+    
+    raise Exception("Failed to start model servers within timeout")
+
+
+def stop_model_servers():
+    """Stop the model server subprocesses"""
+    global embedding_server_process, reranker_server_process
+    
+    logger.info("Stopping model servers...")
+    
+    if embedding_server_process:
+        embedding_server_process.terminate()
+        embedding_server_process.wait(timeout=60)
+        embedding_server_process = None
+        
+    if reranker_server_process:
+        reranker_server_process.terminate()
+        reranker_server_process.wait(timeout=60)
+        reranker_server_process = None
+        
+    logger.info("Model servers stopped")
 
 
 def get_embid2metadata_id(dataset):
@@ -100,49 +184,23 @@ def get_embid2metadata_id(dataset):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize models and load data on startup"""
-    global embedding_model, reranker_model, reranker_tokenizer, metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache
+    """Initialize model servers and load data on startup"""
+    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache
 
     start_time = time.time()
-    logger.info("Starting model initialization...")
+    logger.info("Starting initialization...")
     if DEBUG_MODE:
         logger.info("DEBUG MODE ENABLED - Detailed logging active")
 
     try:
-        # Initialize VLLM models
-        model_start_time = time.time()
-        logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL_NAME}")
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Model config - tensor_parallel_size={config.TENSOR_PARALLEL_SIZE}, gpu_memory_utilization={config.GPU_MEMORY_UTILIZATION}")
-        embedding_model = LLM(
-            model=config.EMBEDDING_MODEL_NAME,
-            trust_remote_code=config.TRUST_REMOTE_CODE,
-            tensor_parallel_size=config.TENSOR_PARALLEL_SIZE,
-            gpu_memory_utilization=config.GPU_MEMORY_UTILIZATION / 2,
-            task="embed",
-        )
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Embedding model loaded in {time.time() - model_start_time:.2f} seconds")
-
-        reranker_start_time = time.time()
-        logger.info(f"Loading reranker model: {config.RERANKER_MODEL_NAME}")
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Reranker config - max_model_len={config.MAX_MODEL_LEN}")
-        reranker_model = LLM(
-            model=config.RERANKER_MODEL_NAME,
-            trust_remote_code=config.TRUST_REMOTE_CODE,
-            tensor_parallel_size=config.TENSOR_PARALLEL_SIZE,
-            gpu_memory_utilization=config.GPU_MEMORY_UTILIZATION * 2,
-            max_model_len=config.MAX_MODEL_LEN,
-            max_num_seqs=config.RERANK_BATCH_SIZE,
-            enable_prefix_caching=True,
-            enforce_eager=True,
-            disable_log_stats=True,
-            max_logprobs=config.MAX_LOGPROBS,
-        )
-        reranker_tokenizer = reranker_model.get_tokenizer()
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Reranker model loaded in {time.time() - reranker_start_time:.2f} seconds")
+        # Start the model servers
+        logger.info("Starting model servers...")
+        start_model_servers()
+        
+        # Register cleanup on exit
+        atexit.register(stop_model_servers)
+        signal.signal(signal.SIGTERM, lambda signum, frame: stop_model_servers())
+        signal.signal(signal.SIGINT, lambda signum, frame: stop_model_servers())
 
         # Load metadata dataset
         metadata_start_time = time.time()
@@ -231,6 +289,7 @@ async def startup_event():
                 
                 if DEBUG_MODE and cache_count % 1000 == 0:
                     logger.info(f"DEBUG: Cached {cache_count} URLs so far...")
+                    break
         
         logger.info(f"URL content cache preloaded with {cache_count} entries in {time.time() - cache_start_time:.2f} seconds")
         if DEBUG_MODE:
@@ -239,6 +298,13 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         raise e
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up on shutdown"""
+    logger.info("Shutting down...")
+    stop_model_servers()
 
 
 def compute_similarity(
@@ -461,16 +527,27 @@ def get_detailed_instruct(task_description: str, query: str) -> str:
 
 
 def get_query_embedding(query: str) -> torch.Tensor:
-    """Get embedding for a query using the embedding model"""
+    """Get embedding for a query using the embedding server"""
     try:
         start_time = time.time()
-        # Generate embedding using the model
-        # Note: Adjust this based on the actual API of Qwen3-Embedding-8B
-        task = (
-            "Given a web search query, retrieve relevant passages that answer the query"
-        )
-        outputs = embedding_model.embed([get_detailed_instruct(task, query)])
-        embedding = torch.tensor(outputs[0].outputs.embedding)
+        
+        # Prepare request to embedding server
+        task = "Given a web search query, retrieve relevant passages that answer the query"
+        url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/embed"
+        
+        payload = {
+            "texts": [query],
+            "task": task
+        }
+        
+        # Send request to embedding server
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        # Extract embedding from response
+        result = response.json()
+        embedding = torch.tensor(result["embeddings"][0])
+        
         if DEBUG_MODE:
             logger.info(f"DEBUG: Query embedding generated in {time.time() - start_time:.3f} seconds")
             logger.info(f"DEBUG: Query: '{query[:100]}...' -> Embedding shape: {embedding.shape}")
@@ -506,22 +583,6 @@ def get_passage_text(passage_id: int) -> str:
     return passage_text.strip()
 
 
-def format_reranker_input(text: str) -> str:
-    global reranker_tokenizer
-    """Format input for reranker model"""
-    messages = [
-        {
-            "role": "system",
-            "content": 'Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be yes or no',
-        },
-        {"role": "user", "content": f"{text}"},
-        {"role": "assistant", "content": ""},
-    ]
-    formatted_text = reranker_tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False
-    )
-    formatted_text = formatted_text[:-13] + "\n\n"
-    return formatted_text
 
 
 def softmax(x, temp=1.0):
@@ -534,12 +595,9 @@ def softmax(x, temp=1.0):
 
 
 def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[tuple]:
-    """Rerank search results using the reranker model"""
-    global reranker_model, reranker_tokenizer, sampling_params
+    """Rerank search results using the reranker server"""
     rerank_start_time = time.time()
     
-    yes_token = reranker_tokenizer("yes", return_tensors="pt").input_ids[0, 0].item()
-    no_token = reranker_tokenizer("no", return_tensors="pt").input_ids[0, 0].item()
     if top_k is None:
         top_k = config.TOP_K_RERANK
     
@@ -548,50 +606,38 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
     try:
         # Prepare input for reranker
         prep_start_time = time.time()
-        rerank_inputs = []
+        rerank_texts = []
         for idx, (passage_id, score) in enumerate(results):
             # Create query-document pairs for reranking
             instruction = "Given a web search query, retrieve relevant passages that answer the query"
-            doc_text = get_passage_text(
-                passage_id
-            )  # Function to get document text by passage_id
-            rerank_inputs.append(
-                format_reranker_input(format_instruction(instruction, query, doc_text))
-            )
+            doc_text = get_passage_text(passage_id)
+            # Format the instruction text
+            formatted_text = format_instruction(instruction, query, doc_text)
+            rerank_texts.append(formatted_text)
             if DEBUG_MODE and idx == 0:
-                logger.info(f"DEBUG: Sample reranker input length: {len(rerank_inputs[0])} chars")
+                logger.info(f"DEBUG: Sample reranker input length: {len(formatted_text)} chars")
         
         if DEBUG_MODE:
-            logger.info(f"DEBUG: Prepared {len(rerank_inputs)} inputs for reranking in {time.time() - prep_start_time:.3f} seconds")
+            logger.info(f"DEBUG: Prepared {len(rerank_texts)} inputs for reranking in {time.time() - prep_start_time:.3f} seconds")
 
-        # Get reranking scores
+        # Send request to reranker server
+        url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/rerank"
+        payload = {"texts": rerank_texts}
+        
         generate_start_time = time.time()
-        outputs = reranker_model.generate(rerank_inputs, sampling_params)
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Reranker generation completed in {time.time() - generate_start_time:.3f} seconds")
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        result = response.json()
+        rerank_scores = result["scores"]
         
-        score_calc_start = time.time()
-        rerank_scores = []
-        for output in outputs:
-            logprobs = [
-                output.outputs[0].logprobs[0].get(yes_token),
-                output.outputs[0].logprobs[0].get(no_token),
-            ]
-            # Convert to actual logprob values
-            logprobs = [x.logprob if x is not None else -np.inf for x in logprobs]
-            # Apply softmax to get probabilities
-            probabilities = softmax(logprobs)
-            rerank_scores.append(probabilities[0])
-
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Reranker server responded in {time.time() - generate_start_time:.3f} seconds")
+        
+        # Combine results with scores
         new_results = []
         for (passage_id, score), rerank_score in zip(results, rerank_scores):
-            # Combine original score with rerank score
-            combined_score = rerank_score
-            new_results.append((passage_id, combined_score))
+            new_results.append((passage_id, rerank_score))
 
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Score calculation completed in {time.time() - score_calc_start:.3f} seconds")
-        
         # Sort by score and return top_k
         reranked = sorted(new_results, key=lambda x: x[1] or 0, reverse=True)
         
@@ -718,8 +764,6 @@ async def search(request: SearchRequest):
         
         if DEBUG_MODE:
             logger.info(f"DEBUG: Total search time: {time.time() - search_start_time:.3f} seconds")
-            logger.info(f"DEBUG: Breakdown - embedding: {time.time() - embed_start:.3f}s, search: {time.time() - search_start:.3f}s, total: {time.time() - search_start_time:.3f}s")
-
         return SearchResponse(results=search_results)
 
     except Exception as e:
@@ -766,11 +810,41 @@ async def visit(request: VisitRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    # Check if model servers are running
+    embedding_healthy = False
+    reranker_healthy = False
+    
+    try:
+        embed_resp = requests.get(
+            f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health", 
+            timeout=5
+        )
+        embedding_healthy = embed_resp.status_code == 200
+    except:
+        pass
+    
+    try:
+        rerank_resp = requests.get(
+            f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/health", 
+            timeout=5
+        )
+        reranker_healthy = rerank_resp.status_code == 200
+    except:
+        pass
+    
     return {
-        "status": "healthy",
-        "models_loaded": {
-            "embedding_model": embedding_model is not None,
-            "reranker_model": reranker_model is not None,
+        "status": "healthy" if embedding_healthy and reranker_healthy else "degraded",
+        "servers": {
+            "embedding_server": {
+                "healthy": embedding_healthy,
+                "url": f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}"
+            },
+            "reranker_server": {
+                "healthy": reranker_healthy,
+                "url": f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}"
+            }
+        },
+        "data_loaded": {
             "metadata_dataset": metadata_dataset is not None,
             "embeddings_matrix": embeddings_matrix is not None,
             "embeddings_shape": (
