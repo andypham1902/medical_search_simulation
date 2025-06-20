@@ -29,6 +29,12 @@ BATCH_SIZE = 65536  # Batch size for GPU processing during search
 USE_GPU_PRELOADING = True  # Enable GPU preloading for better pipeline efficiency
 PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
 
+# Embedding Quantization Configuration
+USE_EMBEDDING_QUANTIZATION = True  # Enable 4-bit quantization for embeddings
+QUANTIZATION_TYPE = "INT4"  # Options: "INT4", "FP4", "INT8", "FP16", "NONE"
+QUANTIZATION_SCALE_BLOCKS = 64  # Number of elements per quantization block for scaling
+KEEP_EMBEDDINGS_ON_GPU = True  # Keep quantized embeddings on GPU to avoid CPU-GPU transfers
+
 # Reranker Configuration
 MAX_LOGPROBS = 8192  # Maximum number of log probabilities to return
 RERANK_BATCH_SIZE = 512  # Batch size for reranking
