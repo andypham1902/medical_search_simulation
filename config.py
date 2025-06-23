@@ -10,9 +10,6 @@ RERANKER_MODEL_NAME = "Qwen/Qwen3-Reranker-8B"
 METADATA_DATASET_NAME = "hoanganhpham/Miriad_Pubmed_metadata"
 
 # VLLM Configuration
-TENSOR_PARALLEL_SIZE = 1
-GPU_MEMORY_UTILIZATION = 0.4  # Adjust based on your GPU memory
-MAX_MODEL_LEN = 4096  # Maximum sequence length
 TRUST_REMOTE_CODE = True
 
 # API Configuration
@@ -69,10 +66,18 @@ RERANKER_SERVER_PORT = 10002
 
 # GPU allocation for separate servers
 EMBEDDING_GPU_DEVICES = "0,1,2,3"  # GPU device(s) for embedding server
-RERANK_GPU_DEVICES = "1,2,3,4"  # GPU device(s) for reranker server
+RERANK_GPU_DEVICES = "4,5,6,7"  # GPU device(s) for reranker server
 
 # Model server specific configurations
 EMBEDDING_TENSOR_PARALLEL_SIZE = 4
 EMBEDDING_GPU_MEMORY_UTILIZATION = 0.2
+MAX_MODEL_LEN = 4096  # Maximum sequence length
+
 RERANK_TENSOR_PARALLEL_SIZE = 4
 RERANK_GPU_MEMORY_UTILIZATION = 0.8
+MAX_RERANK_LEN = 16384  # Maximum sequence length for reranker
+
+# Cache Configuration
+USE_STARTUP_CACHE = True  # Enable caching of startup data
+CACHE_DIR = "/mnt/sharefs/tuenv/medical_search_cache"  # Directory for cache files
+FORCE_CACHE_REBUILD = False  # Force rebuilding cache even if valid

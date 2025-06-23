@@ -21,6 +21,7 @@ import signal
 import atexit
 import sys
 from quantization_utils import EmbeddingQuantizer
+from cache_utils import StartupDataCache
 
 
 # Configure logging
@@ -77,25 +78,34 @@ quantizer = None  # EmbeddingQuantizer instance
 quantized_embeddings = None  # Quantized embeddings (on GPU if configured)
 quantization_metadata = None  # Metadata for dequantization
 
+# Cache instance
+startup_cache = None  # StartupDataCache instance
+
 # Server process references
 embedding_server_process = None
 reranker_server_process = None
 
 
 def start_model_servers():
-    """Start embedding and reranker servers as subprocesses"""
+    """Start embedding and reranker servers using vllm serve"""
     global embedding_server_process, reranker_server_process
     
-    logger.info("Starting model servers...")
+    logger.info("Starting VLLM model servers...")
     
-    # Start embedding server
+    # Start embedding server using vllm serve
     embedding_cmd = [
-        sys.executable,
-        "embedding_server.py",
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", config.EMBEDDING_MODEL_NAME,
         "--port", str(config.EMBEDDING_SERVER_PORT),
-        "--host", config.EMBEDDING_SERVER_HOST
+        "--host", config.EMBEDDING_SERVER_HOST,
+        "--tensor-parallel-size", str(config.EMBEDDING_TENSOR_PARALLEL_SIZE),
+        "--gpu-memory-utilization", str(config.EMBEDDING_GPU_MEMORY_UTILIZATION),
+        "--max-model-len", str(config.MAX_MODEL_LEN),
+        "--trust-remote-code",
+        "--served-model-name", "embedding-model",
+        "--task", "embed"  # Specify embedding task
     ]
-    logger.info(f"Starting embedding server: {' '.join(embedding_cmd)}")
+    logger.info(f"Starting VLLM embedding server: {' '.join(embedding_cmd)}")
     embedding_server_process = subprocess.Popen(
         embedding_cmd,
         stdout=subprocess.PIPE,
@@ -103,14 +113,20 @@ def start_model_servers():
         env={**os.environ, "CUDA_VISIBLE_DEVICES": config.EMBEDDING_GPU_DEVICES}
     )
     
-    # Start reranker server
+    # Start reranker server using vllm serve
     reranker_cmd = [
-        sys.executable,
-        "reranker_server.py",
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", config.RERANKER_MODEL_NAME,
         "--port", str(config.RERANKER_SERVER_PORT),
-        "--host", config.RERANKER_SERVER_HOST
+        "--host", config.RERANKER_SERVER_HOST,
+        "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
+        "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
+        "--max-model-len", str(config.MAX_RERANK_LEN),
+        "--trust-remote-code",
+        "--served-model-name", "reranker-model",
+        "--task", "generate",
     ]
-    logger.info(f"Starting reranker server: {' '.join(reranker_cmd)}")
+    logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
     reranker_server_process = subprocess.Popen(
         reranker_cmd,
         stdout=subprocess.PIPE,
@@ -118,11 +134,11 @@ def start_model_servers():
         env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
     )
     
-    # Wait for servers to be ready
+    # Wait for servers to be ready using VLLM's OpenAI-compatible health endpoint
     embedding_url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health"
     reranker_url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/health"
     
-    max_retries = config.MODEL_LOADING_TIMEOUT  # 60 seconds timeout
+    max_retries = config.MODEL_LOADING_TIMEOUT  # 600 seconds timeout
     for i in range(max_retries):
         time.sleep(1)
         try:
@@ -135,15 +151,15 @@ def start_model_servers():
             rerank_ready = rerank_resp.status_code == 200
             
             if embed_ready and rerank_ready:
-                logger.info("Both model servers are ready!")
+                logger.info("Both VLLM servers are ready!")
                 return True
                 
         except requests.exceptions.RequestException:
-            if i % 60 == 0:
-                logger.info(f"Waiting for servers to start... ({i}s)")
+            if i % 10 == 0:
+                logger.info(f"Waiting for VLLM servers to start... ({i}s)")
             continue
     
-    raise Exception("Failed to start model servers within timeout")
+    raise Exception("Failed to start VLLM servers within timeout")
 
 
 def stop_model_servers():
@@ -191,7 +207,7 @@ def get_embid2metadata_id(dataset):
 @app.on_event("startup")
 async def startup_event():
     """Initialize model servers and load data on startup"""
-    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, quantizer, quantized_embeddings, quantization_metadata
+    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, quantizer, quantized_embeddings, quantization_metadata, startup_cache
 
     start_time = time.time()
     logger.info("Starting initialization...")
@@ -199,6 +215,13 @@ async def startup_event():
         logger.info("DEBUG MODE ENABLED - Detailed logging active")
 
     try:
+        # Initialize cache
+        if config.USE_STARTUP_CACHE:
+            startup_cache = StartupDataCache(config.CACHE_DIR)
+            logger.info("Initialized startup data cache")
+        else:
+            logger.info("Startup caching disabled")
+            startup_cache = None
         # Start the model servers
         logger.info("Starting model servers...")
         start_model_servers()
@@ -213,166 +236,239 @@ async def startup_event():
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        # Load metadata dataset
+        # Try to load from cache first
+        cache_loaded = False
+        if startup_cache and not config.FORCE_CACHE_REBUILD:
+            logger.info("Attempting to load data from cache...")
+            cache_start_time = time.time()
+            
+            cached_emb_mapping, cached_quantized_embeddings, cached_quantization_metadata, cached_url_content = startup_cache.load_all_cache_data()
+            
+            if cached_emb_mapping is not None:
+                emb_id_to_metadata_id = cached_emb_mapping
+                logger.info(f"Loaded embedding ID mapping from cache ({len(emb_id_to_metadata_id)} entries)")
+                
+                # Load quantized embeddings if available
+                if cached_quantized_embeddings is not None and cached_quantization_metadata is not None:
+                    quantized_embeddings = cached_quantized_embeddings
+                    quantization_metadata = cached_quantization_metadata
+                    
+                    # Move to GPU if available
+                    if torch.cuda.is_available():
+                        logger.info("Moving cached quantized embeddings to GPU...")
+                        quantized_embeddings = quantized_embeddings.cuda()
+                        
+                        # Move metadata to GPU if applicable
+                        if "scales" in quantization_metadata and quantization_metadata["scales"] is not None:
+                            quantization_metadata["scales"] = quantization_metadata["scales"].cuda()
+                        if "zeros" in quantization_metadata and quantization_metadata["zeros"] is not None:
+                            quantization_metadata["zeros"] = quantization_metadata["zeros"].cuda()
+                        if "norms" in quantization_metadata:
+                            quantization_metadata["norms"] = quantization_metadata["norms"].cuda()
+                    
+                    logger.info(f"Loaded quantized embeddings from cache (shape: {quantized_embeddings.shape})")
+                
+                # Load URL content cache if available
+                if cached_url_content is not None:
+                    url_content_cache = cached_url_content
+                    logger.info(f"Loaded URL content cache from cache ({len(url_content_cache)} entries)")
+                
+                cache_loaded = True
+                logger.info(f"Successfully loaded all data from cache in {time.time() - cache_start_time:.2f} seconds")
+            else:
+                logger.info("Cache data not available or invalid, proceeding with normal loading")
+
+        if not cache_loaded:
+            logger.info("Loading data from source (cache not used)")
+
+        # Load metadata dataset (always needed for queries even when using cache)
         metadata_start_time = time.time()
         logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME}")
         metadata_dataset = load_dataset(config.METADATA_DATASET_NAME, split="train")
         if DEBUG_MODE:
             metadata_dataset = metadata_dataset.select(range(1000))  # Limit to 1000 for debugging
-        emb_id_to_metadata_id = get_embid2metadata_id(metadata_dataset)
+        
+        # Only create embedding ID mapping if not loaded from cache
+        if not cache_loaded:
+            emb_id_to_metadata_id = get_embid2metadata_id(metadata_dataset)
+        
         logger.info(f"Loaded {len(metadata_dataset)} metadata records")
         if DEBUG_MODE:
             logger.info(f"DEBUG: Metadata loaded in {time.time() - metadata_start_time:.2f} seconds")
             logger.info(f"DEBUG: Total embedding ID to metadata ID mappings: {len(emb_id_to_metadata_id)}")
 
-        # Load embedding files sequentially (embeddings_0.pt to embeddings_500.pt)
-        embeddings_start_time = time.time()
-        logger.info("Loading embedding files sequentially...")
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Loading {config.MAX_EMBEDDING_FILES} embedding files from {config.EMBEDDING_FOLDER}")
-        embedding_tensors = []
+        # Load embedding files and apply quantization only if not loaded from cache
+        if not cache_loaded:
+            embeddings_start_time = time.time()
+            logger.info("Loading embedding files in parallel...")
+            if DEBUG_MODE:
+                logger.info(f"DEBUG: Loading {config.MAX_EMBEDDING_FILES} embedding files from {config.EMBEDDING_FOLDER}")
+            embedding_tensors = []
 
-        for i in range(config.MAX_EMBEDDING_FILES):
-            file_path = f"{config.EMBEDDING_FOLDER}/embeddings_{i}.pt"
-            try:
-                # Load embeddings to CPU memory to avoid GPU memory usage during startup
-                file_load_start = time.time()
-                embeddings = torch.load(file_path, map_location="cpu")
-                # Ensure embeddings is 2D (add batch dimension if needed)
-                if embeddings.dim() == 1:
-                    embeddings = embeddings.unsqueeze(0)
-                embedding_tensors.extend(embeddings)
-
-                if DEBUG_MODE and i % 10 == 0:
-                    logger.info(
-                        f"DEBUG: Loaded embeddings_{i}.pt in {time.time() - file_load_start:.3f}s - Shape: {embeddings.shape} ({i+1}/{config.MAX_EMBEDDING_FILES})"
-                    )
-                    break
-                elif i % 50 == 0:
-                    logger.info(
-                        f"Loaded embeddings_{i}.pt ({i+1}/{config.MAX_EMBEDDING_FILES})"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to load embeddings_{i}.pt: {e}")
-                # Create a zero tensor as placeholder to maintain indexing
-                placeholder = torch.zeros(8192, config.EMBEDDING_DIMENSION)
-                embedding_tensors.append(placeholder)
-
-        # Concatenate all embeddings into a single matrix
-        if embedding_tensors:
-            # First, ensure all tensors have the same shape
-            embedding_shapes = [t.shape for t in embedding_tensors]
-            unique_shapes = list(set(embedding_shapes))
-            if len(unique_shapes) > 1:
-                logger.warning(f"Found embeddings with different shapes: {unique_shapes}")
-                # Flatten all to 1D if needed
-                embedding_tensors = [t.flatten() if t.dim() == 1 else t for t in embedding_tensors]
+            def load_embedding_file(i):
+                """Load a single embedding file"""
+                file_path = f"{config.EMBEDDING_FOLDER}/embeddings_{i}.pt"
+                try:
+                    # Load embeddings to CPU memory to avoid GPU memory usage during startup
+                    embeddings = torch.load(file_path, map_location="cpu")
+                    # Ensure embeddings is 2D (add batch dimension if needed)
+                    if embeddings.dim() == 1:
+                        embeddings = embeddings.unsqueeze(0)
+                    return i, embeddings
+                except Exception as e:
+                    logger.warning(f"Failed to load embeddings_{i}.pt: {e}")
+                    # Create a zero tensor as placeholder to maintain indexing
+                    placeholder = torch.zeros(8192, config.EMBEDDING_DIMENSION)
+                    return i, placeholder
             
-            # Stack embeddings
-            try:
-                embeddings_matrix = torch.vstack(embedding_tensors)
-            except:
-                # Fallback to concatenating along first dimension
-                embeddings_matrix = torch.cat([t.unsqueeze(0) if t.dim() == 1 else t for t in embedding_tensors], dim=0)
+            # Load embeddings in parallel
+            max_files = config.MAX_EMBEDDING_FILES
+            if DEBUG_MODE:
+                max_files = min(10, max_files)  # Limit files in debug mode
             
-            logger.info(
-                f"Successfully created embeddings matrix with shape: {embeddings_matrix.shape}"
-            )
-        else:
-            logger.error("No embedding files were loaded successfully")
-            raise Exception("Failed to load any embedding files")
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: All embeddings loaded in {time.time() - embeddings_start_time:.2f} seconds")
+            # Use ThreadPoolExecutor for parallel I/O
+            with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
+                # Submit all file loading tasks
+                futures = {executor.submit(load_embedding_file, i): i for i in range(max_files)}
+                
+                # Create a list to store embeddings in order
+                embedding_results = [None] * max_files
+                completed = 0
+                
+                # Collect results as they complete
+                for future in futures:
+                    idx, embeddings = future.result()
+                    embedding_results[idx] = embeddings
+                    completed += 1
+                    
+                    if completed % 50 == 0 or (DEBUG_MODE and completed % 5 == 0):
+                        logger.info(f"Loaded {completed}/{max_files} embedding files...")
+                
+                # Flatten the results into embedding_tensors
+                for embeddings in embedding_results:
+                    if isinstance(embeddings, torch.Tensor):
+                        if embeddings.dim() == 2:
+                            embedding_tensors.extend(embeddings)
+                        else:
+                            embedding_tensors.append(embeddings)
+
+            # Concatenate all embeddings into a single matrix
+            if embedding_tensors:
+                # First, ensure all tensors have the same shape
+                embedding_shapes = [t.shape for t in embedding_tensors]
+                unique_shapes = list(set(embedding_shapes))
+                if len(unique_shapes) > 1:
+                    logger.warning(f"Found embeddings with different shapes: {unique_shapes}")
+                    # Flatten all to 1D if needed
+                    embedding_tensors = [t.flatten() if t.dim() == 1 else t for t in embedding_tensors]
+                
+                # Stack embeddings
+                try:
+                    embeddings_matrix = torch.vstack(embedding_tensors)
+                except:
+                    # Fallback to concatenating along first dimension
+                    embeddings_matrix = torch.cat([t.unsqueeze(0) if t.dim() == 1 else t for t in embedding_tensors], dim=0)
+                
+                logger.info(
+                    f"Successfully created embeddings matrix with shape: {embeddings_matrix.shape}"
+                )
+            else:
+                logger.error("No embedding files were loaded successfully")
+                raise Exception("Failed to load any embedding files")
+            if DEBUG_MODE:
+                logger.info(f"DEBUG: All embeddings loaded in {time.time() - embeddings_start_time:.2f} seconds")
         
-        # Apply quantization if enabled
-        if config.USE_EMBEDDING_QUANTIZATION and config.QUANTIZATION_TYPE != "NONE":
-            logger.info(f"Applying {config.QUANTIZATION_TYPE} quantization to embeddings...")
-            quantization_start_time = time.time()
-            
-            # Initialize quantizer
-            quantizer = EmbeddingQuantizer(
-                quantization_type=config.QUANTIZATION_TYPE,
-                scale_blocks=config.QUANTIZATION_SCALE_BLOCKS
-            )
-            
-            # Quantize embeddings using batching to avoid OOM
-            try:
-                if config.QUANTIZATION_TYPE in ["INT4", "INT8"]:
-                    # Use similarity-aware quantization for better search quality with batching
-                    quantized_embeddings, quantization_metadata = quantizer.quantize_similarity_aware(
-                        embeddings_matrix, 
-                        batch_size=config.QUANTIZATION_BATCH_SIZE
-                    )
-                else:
-                    # Standard quantization for FP16 - also implement batching if needed
-                    if embeddings_matrix.shape[0] > config.QUANTIZATION_BATCH_SIZE:
-                        logger.info(f"Applying batched quantization for {config.QUANTIZATION_TYPE}")
-                        quantized_embeddings, quantization_metadata = quantizer._quantize_batched(
-                            embeddings_matrix,
-                            config.QUANTIZATION_BATCH_SIZE
+            # Apply quantization if enabled
+            if config.USE_EMBEDDING_QUANTIZATION and config.QUANTIZATION_TYPE != "NONE":
+                logger.info(f"Applying {config.QUANTIZATION_TYPE} quantization to embeddings...")
+                quantization_start_time = time.time()
+                
+                # Initialize quantizer
+                quantizer = EmbeddingQuantizer(
+                    quantization_type=config.QUANTIZATION_TYPE,
+                    scale_blocks=config.QUANTIZATION_SCALE_BLOCKS
+                )
+                
+                # Quantize embeddings using batching to avoid OOM
+                try:
+                    if config.QUANTIZATION_TYPE in ["INT4", "INT8"]:
+                        # Use similarity-aware quantization for better search quality with batching
+                        quantized_embeddings, quantization_metadata = quantizer.quantize_similarity_aware(
+                            embeddings_matrix, 
+                            batch_size=config.QUANTIZATION_BATCH_SIZE
                         )
                     else:
-                        quantized_embeddings, scales, zeros, metadata = quantizer.quantize(embeddings_matrix)
-                        quantization_metadata = {
-                            "type": config.QUANTIZATION_TYPE,
-                            "scales": scales,
-                            "zeros": zeros,
-                            "metadata": metadata
-                        }
-                
-                # Clear original embeddings from memory immediately after quantization to save memory
-                del embeddings_matrix
-                embeddings_matrix = None
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                logger.info("Original embeddings cleared from memory after quantization")
-            except Exception as e:
-                logger.error(f"Quantization failed: {e}")
-                logger.error("Falling back to no quantization")
-                config.USE_EMBEDDING_QUANTIZATION = False
-                quantized_embeddings = None
-                quantization_metadata = None
-                import traceback
-                traceback.print_exc()
-            
-            # Move to GPU if available
-            if torch.cuda.is_available():
-                logger.info("Moving quantized embeddings to GPU...")
-                gpu_start_time = time.time()
-                quantized_embeddings = quantized_embeddings.cuda()
-                
-                # Move metadata to GPU if applicable
-                if "scales" in quantization_metadata and quantization_metadata["scales"] is not None:
-                    quantization_metadata["scales"] = quantization_metadata["scales"].cuda()
-                if "zeros" in quantization_metadata and quantization_metadata["zeros"] is not None:
-                    quantization_metadata["zeros"] = quantization_metadata["zeros"].cuda()
-                if "norms" in quantization_metadata:
-                    quantization_metadata["norms"] = quantization_metadata["norms"].cuda()
+                        # Standard quantization for FP16 - also implement batching if needed
+                        if embeddings_matrix.shape[0] > config.QUANTIZATION_BATCH_SIZE:
+                            logger.info(f"Applying batched quantization for {config.QUANTIZATION_TYPE}")
+                            quantized_embeddings, quantization_metadata = quantizer._quantize_batched(
+                                embeddings_matrix,
+                                config.QUANTIZATION_BATCH_SIZE
+                            )
+                        else:
+                            quantized_embeddings, scales, zeros, metadata = quantizer.quantize(embeddings_matrix)
+                            quantization_metadata = {
+                                "type": config.QUANTIZATION_TYPE,
+                                "scales": scales,
+                                "zeros": zeros,
+                                "metadata": metadata
+                            }
                     
-                logger.info(f"Quantized embeddings moved to GPU in {time.time() - gpu_start_time:.2f} seconds")
-            
-            # Calculate memory savings using stored embedding tensor info
-            if quantized_embeddings is not None:
-                # Estimate original size from quantization metadata or config
-                embedding_count = len(emb_id_to_metadata_id)
-                embedding_dim = config.EMBEDDING_DIMENSION
-                original_size_estimate = embedding_count * embedding_dim * 4 / 1024 / 1024 / 1024  # 4 bytes per float32
-                quantized_size = quantized_embeddings.element_size() * quantized_embeddings.numel() / 1024 / 1024 / 1024  # GB
+                    # Clear original embeddings from memory immediately after quantization to save memory
+                    del embeddings_matrix
+                    embeddings_matrix = None
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    logger.info("Original embeddings cleared from memory after quantization")
+                except Exception as e:
+                    logger.error(f"Quantization failed: {e}")
+                    logger.error("Falling back to no quantization")
+                    config.USE_EMBEDDING_QUANTIZATION = False
+                    quantized_embeddings = None
+                    quantization_metadata = None
+                    import traceback
+                    traceback.print_exc()
                 
-                logger.info(f"Quantization completed in {time.time() - quantization_start_time:.2f} seconds")
-                logger.info(f"Memory usage: ~{original_size_estimate:.2f} GB -> {quantized_size:.2f} GB (~{(1 - quantized_size/original_size_estimate)*100:.1f}% reduction)")
+                # Move to GPU if available
+                if torch.cuda.is_available():
+                    logger.info("Moving quantized embeddings to GPU...")
+                    gpu_start_time = time.time()
+                    quantized_embeddings = quantized_embeddings.cuda()
+                    
+                    # Move metadata to GPU if applicable
+                    if "scales" in quantization_metadata and quantization_metadata["scales"] is not None:
+                        quantization_metadata["scales"] = quantization_metadata["scales"].cuda()
+                    if "zeros" in quantization_metadata and quantization_metadata["zeros"] is not None:
+                        quantization_metadata["zeros"] = quantization_metadata["zeros"].cuda()
+                    if "norms" in quantization_metadata:
+                        quantization_metadata["norms"] = quantization_metadata["norms"].cuda()
+                        
+                    logger.info(f"Quantized embeddings moved to GPU in {time.time() - gpu_start_time:.2f} seconds")
+                
+                # Calculate memory savings using stored embedding tensor info
+                if quantized_embeddings is not None:
+                    # Estimate original size from quantization metadata or config
+                    embedding_count = len(emb_id_to_metadata_id)
+                    embedding_dim = config.EMBEDDING_DIMENSION
+                    original_size_estimate = embedding_count * embedding_dim * 4 / 1024 / 1024 / 1024  # 4 bytes per float32
+                    quantized_size = quantized_embeddings.element_size() * quantized_embeddings.numel() / 1024 / 1024 / 1024  # GB
+                    
+                    logger.info(f"Quantization completed in {time.time() - quantization_start_time:.2f} seconds")
+                    logger.info(f"Memory usage: ~{original_size_estimate:.2f} GB -> {quantized_size:.2f} GB (~{(1 - quantized_size/original_size_estimate)*100:.1f}% reduction)")
+                
+                if DEBUG_MODE:
+                    logger.info(f"DEBUG: All embeddings and quantization completed in {time.time() - embeddings_start_time:.2f} seconds")
         
-        logger.info("Model initialization completed!")
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Total initialization time: {time.time() - start_time:.2f} seconds")
-        
-        # Preload URL content cache
-        cache_start_time = time.time()
-        logger.info("Preloading URL content cache...")
-        cache_count = 0
-        
-        for idx, item in enumerate(metadata_dataset):
-            url = item.get("paper_url")
-            if url:
+        # Preload URL content cache only if not loaded from cache
+        if not cache_loaded:
+            cache_start_time = time.time()
+            logger.info("Preloading URL content cache using parallel processing...")
+            
+            def process_item(item):
+                """Process a single item to create URL content"""
+                url = item.get("paper_url")
+                if not url:
+                    return None, None
+                
                 # Get paper title
                 paper_title = item.get("paper_title", "Untitled")
                 
@@ -386,17 +482,51 @@ async def startup_event():
                 # Combine title and content
                 unified_content = f"# {paper_title}\n\n{full_content}".strip()
                 
-                # Store in cache
-                url_content_cache[url] = unified_content
-                cache_count += 1
+                return url, unified_content
+            
+            # Process items in parallel using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() * 2)) as executor:
+                # Submit all items for processing
+                futures = []
+                for idx, item in enumerate(metadata_dataset):
+                    if DEBUG_MODE and idx >= 1000:
+                        break
+                    futures.append(executor.submit(process_item, item))
                 
-                if DEBUG_MODE and cache_count % 1000 == 0:
-                    logger.info(f"DEBUG: Cached {cache_count} URLs so far...")
-                    break
+                # Collect results as they complete
+                cache_count = 0
+                for future in futures:
+                    url, content = future.result()
+                    if url and content:
+                        url_content_cache[url] = content
+                        cache_count += 1
+                        
+                        if cache_count % 10000 == 0:
+                            logger.info(f"Cached {cache_count} URLs so far...")
+            
+            logger.info(f"URL content cache preloaded with {cache_count} entries in {time.time() - cache_start_time:.2f} seconds")
+            if DEBUG_MODE:
+                logger.info(f"DEBUG: Average cache entry size: {sum(len(content) for content in url_content_cache.values()) / len(url_content_cache):.0f} chars")
         
-        logger.info(f"URL content cache preloaded with {cache_count} entries in {time.time() - cache_start_time:.2f} seconds")
+            # Save to cache if we loaded from source and caching is enabled
+            if startup_cache:
+                logger.info("Saving data to cache for future startups...")
+                save_start_time = time.time()
+                try:
+                    startup_cache.save_all_cache_data(
+                        emb_id_to_metadata_id=emb_id_to_metadata_id,
+                        quantized_embeddings=quantized_embeddings,
+                        quantization_metadata=quantization_metadata,
+                        url_content_cache=url_content_cache
+                    )
+                    logger.info(f"Successfully saved all data to cache in {time.time() - save_start_time:.2f} seconds")
+                except Exception as e:
+                    logger.error(f"Failed to save data to cache: {e}")
+                    # Don't fail startup if cache saving fails
+        
+        logger.info("Model initialization completed!")
         if DEBUG_MODE:
-            logger.info(f"DEBUG: Average cache entry size: {sum(len(content) for content in url_content_cache.values()) / len(url_content_cache):.0f} chars")
+            logger.info(f"DEBUG: Total initialization time: {time.time() - start_time:.2f} seconds")
 
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -754,26 +884,30 @@ def get_detailed_instruct(task_description: str, query: str) -> str:
 
 
 def get_query_embedding(query: str) -> torch.Tensor:
-    """Get embedding for a query using the embedding server"""
+    """Get embedding for a query using VLLM's OpenAI-compatible embedding endpoint"""
     try:
         start_time = time.time()
         
-        # Prepare request to embedding server
-        task = "Given a web search query, retrieve relevant passages that answer the query"
-        url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/embed"
+        # Prepare request using OpenAI-compatible embeddings endpoint
+        url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/v1/embeddings"
+        
+        # Format query with instruction for retrieval task
+        task_instruction = "Given a web search query, retrieve relevant passages that answer the query"
+        formatted_input = f"Instruct: {task_instruction}\nQuery: {query}"
         
         payload = {
-            "texts": [query],
-            "task": task
+            "model": "embedding-model",  # The served model name we specified
+            "input": formatted_input,
+            "encoding_format": "float"
         }
         
-        # Send request to embedding server
+        # Send request to VLLM's OpenAI-compatible embeddings endpoint
         response = requests.post(url, json=payload, timeout=30)
         response.raise_for_status()
         
-        # Extract embedding from response
+        # Extract embedding from OpenAI-compatible response format
         result = response.json()
-        embedding = torch.tensor(result["embeddings"][0])
+        embedding = torch.tensor(result["data"][0]["embedding"])
         
         if DEBUG_MODE:
             logger.info(f"DEBUG: Query embedding generated in {time.time() - start_time:.3f} seconds")
@@ -847,15 +981,42 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
         if DEBUG_MODE:
             logger.info(f"DEBUG: Prepared {len(rerank_texts)} inputs for reranking in {time.time() - prep_start_time:.3f} seconds")
 
-        # Send request to reranker server
-        url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/rerank"
-        payload = {"texts": rerank_texts}
+        # Send request to VLLM's OpenAI-compatible completions endpoint for scoring
+        url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/completions"
         
+        # Process each text for reranking using VLLM's scoring capability
+        rerank_scores = []
         generate_start_time = time.time()
-        response = requests.post(url, json=payload, timeout=60)
-        response.raise_for_status()
-        result = response.json()
-        rerank_scores = result["scores"]
+        
+        # Batch process for efficiency
+        batch_size = config.RERANK_BATCH_SIZE
+        for i in range(0, len(rerank_texts), batch_size):
+            batch_texts = rerank_texts[i:i+batch_size]
+            
+            # Use VLLM's completions endpoint with logprobs to get scores
+            payload = {
+                "model": "reranker-model",
+                "prompt": batch_texts,
+                "max_tokens": 1,  # We only need the score, not generation
+                "logprobs": True,
+                "echo": True,  # Include the prompt in the response for scoring
+                "temperature": 0.0
+            }
+            
+            response = requests.post(url, json=payload, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            
+            # Extract scores from logprobs
+            for choice in result["choices"]:
+                # Get the average log probability as the relevance score
+                if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
+                    # Average log probability of the tokens (higher is better)
+                    logprobs = [lp for lp in choice["logprobs"]["token_logprobs"] if lp is not None]
+                    score = sum(logprobs) / len(logprobs) if logprobs else -100.0
+                else:
+                    score = -100.0  # Default low score if no logprobs
+                rerank_scores.append(score)
         
         if DEBUG_MODE:
             logger.info(f"DEBUG: Reranker server responded in {time.time() - generate_start_time:.3f} seconds")
@@ -1082,8 +1243,37 @@ async def health_check():
             "url_content_cache_size": len(url_content_cache),
             "total_cache_memory_mb": sum(len(content) for content in url_content_cache.values()) / (1024 * 1024) if url_content_cache else 0,
             "cache_initialized": bool(url_content_cache),
+            "startup_cache_enabled": config.USE_STARTUP_CACHE,
+            "startup_cache_stats": startup_cache.get_cache_stats() if startup_cache else None,
         },
     }
+
+
+@app.get("/cache")
+async def cache_info():
+    """Get cache information and statistics"""
+    if not startup_cache:
+        return {"error": "Startup caching is disabled"}
+    
+    return {
+        "cache_enabled": config.USE_STARTUP_CACHE,
+        "cache_dir": config.CACHE_DIR,
+        "force_rebuild": config.FORCE_CACHE_REBUILD,
+        "stats": startup_cache.get_cache_stats(),
+    }
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Clear startup cache"""
+    if not startup_cache:
+        return {"error": "Startup caching is disabled"}
+    
+    try:
+        startup_cache.clear_cache()
+        return {"message": "Cache cleared successfully"}
+    except Exception as e:
+        return {"error": f"Failed to clear cache: {str(e)}"}
 
 
 @app.get("/")
@@ -1096,6 +1286,8 @@ async def root():
             "search": "POST /search - Search for documents (optional: use_reranker)",
             "visit": "POST /visit - Get passages from a document URL",
             "health": "GET /health - Health check",
+            "cache": "GET /cache - Get cache information",
+            "cache/clear": "POST /cache/clear - Clear startup cache",
         },
     }
 
