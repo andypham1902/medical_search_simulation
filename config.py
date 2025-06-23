@@ -7,7 +7,7 @@ import os
 # Model Configuration
 EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
 RERANKER_MODEL_NAME = "Qwen/Qwen3-Reranker-8B"
-METADATA_DATASET_NAME = "hoanganhpham/Miriad_metadata"
+METADATA_DATASET_NAME = "hoanganhpham/Miriad_Pubmed_metadata"
 
 # VLLM Configuration
 TENSOR_PARALLEL_SIZE = 1
@@ -33,15 +33,15 @@ PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
 USE_EMBEDDING_QUANTIZATION = True  # Enable 4-bit quantization for embeddings
 QUANTIZATION_TYPE = "INT4"  # Options: "INT4", "FP4", "INT8", "FP16", "NONE"
 QUANTIZATION_SCALE_BLOCKS = 64  # Number of elements per quantization block for scaling
-KEEP_EMBEDDINGS_ON_GPU = True  # Keep quantized embeddings on GPU to avoid CPU-GPU transfers
+QUANTIZATION_BATCH_SIZE = 100000  # Number of embeddings to quantize at once to avoid OOM
 
 # Reranker Configuration
 MAX_LOGPROBS = 8192  # Maximum number of log probabilities to return
-RERANK_BATCH_SIZE = 512  # Batch size for reranking
+RERANK_BATCH_SIZE = 32  # Batch size for reranking
 
 # File Paths
-EMBEDDING_FOLDER = "/mnt/sharefs/tuenv/embeddings/Miriad_Embedding/"
-MAX_EMBEDDING_FILES = 282  # Define correctly number of emb files
+EMBEDDING_FOLDER = "/mnt/sharefs/tuenv/embeddings/"
+MAX_EMBEDDING_FILES = 3205  # Define correctly number of emb files
 
 # Logging Configuration
 LOG_LEVEL = "INFO"
@@ -68,11 +68,11 @@ RERANKER_SERVER_HOST = "127.0.0.1"
 RERANKER_SERVER_PORT = 10002
 
 # GPU allocation for separate servers
-EMBEDDING_GPU_DEVICES = "0"  # GPU device(s) for embedding server
+EMBEDDING_GPU_DEVICES = "0,1,2,3"  # GPU device(s) for embedding server
 RERANK_GPU_DEVICES = "1,2,3,4"  # GPU device(s) for reranker server
 
 # Model server specific configurations
-EMBEDDING_TENSOR_PARALLEL_SIZE = 1
-EMBEDDING_GPU_MEMORY_UTILIZATION = 0.4
+EMBEDDING_TENSOR_PARALLEL_SIZE = 4
+EMBEDDING_GPU_MEMORY_UTILIZATION = 0.2
 RERANK_TENSOR_PARALLEL_SIZE = 4
 RERANK_GPU_MEMORY_UTILIZATION = 0.8

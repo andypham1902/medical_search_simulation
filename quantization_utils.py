@@ -177,7 +177,8 @@ class EmbeddingQuantizer:
         return dequantized
     
     def quantize_similarity_aware(self, embeddings: torch.Tensor, 
-                                  reference_embedding: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict]:
+                                  reference_embedding: Optional[torch.Tensor] = None,
+                                  batch_size: int = 10000) -> Tuple[torch.Tensor, dict]:
         """
         Quantize embeddings with awareness of similarity computation
         This method optimizes quantization for dot product similarity
@@ -185,6 +186,7 @@ class EmbeddingQuantizer:
         Args:
             embeddings: Embeddings to quantize
             reference_embedding: Optional reference embedding for adaptive quantization
+            batch_size: Number of embeddings to process at once to avoid OOM
             
         Returns:
             Tuple of (quantized_embeddings, quantization_metadata)
@@ -192,6 +194,10 @@ class EmbeddingQuantizer:
         if self.quantization_type in ["NONE", "FP16"]:
             quantized, _, _, _ = self.quantize(embeddings)
             return quantized, {"type": self.quantization_type}
+        
+        # For large embedding matrices, process in batches to avoid OOM
+        if embeddings.shape[0] > batch_size:
+            return self._quantize_similarity_aware_batched(embeddings, batch_size)
             
         # For INT4/INT8, we can optimize the quantization for similarity computation
         # Normalize embeddings before quantization to preserve relative similarities
@@ -213,6 +219,171 @@ class EmbeddingQuantizer:
         }
         
         return quantized, quant_metadata
+        
+    def _quantize_similarity_aware_batched(self, embeddings: torch.Tensor, 
+                                          batch_size: int) -> Tuple[torch.Tensor, dict]:
+        """
+        Batch-wise quantization for large embedding matrices to avoid OOM
+        
+        Args:
+            embeddings: Large embedding matrix to quantize
+            batch_size: Number of embeddings per batch
+            
+        Returns:
+            Tuple of (quantized_embeddings, quantization_metadata)
+        """
+        logger.info(f"Applying batched quantization with batch_size={batch_size}")
+        
+        num_embeddings = embeddings.shape[0]
+        embedding_dim = embeddings.shape[1]
+        
+        # Lists to collect batched results
+        quantized_batches = []
+        scales_batches = []
+        zeros_batches = []
+        norms_batches = []
+        
+        # Keep track of metadata from first batch for consistency
+        combined_metadata = None
+        
+        for i in range(0, num_embeddings, batch_size):
+            end_idx = min(i + batch_size, num_embeddings)
+            batch_embeddings = embeddings[i:end_idx]
+            
+            logger.info(f"Quantizing batch {i//batch_size + 1}/{(num_embeddings + batch_size - 1)//batch_size} "
+                       f"(embeddings {i}-{end_idx-1})")
+            
+            # Normalize embeddings for this batch
+            batch_norms = torch.norm(batch_embeddings, dim=-1, keepdim=True)
+            batch_normalized = batch_embeddings / (batch_norms + 1e-8)
+            
+            # Quantize this batch
+            batch_quantized, batch_scales, batch_zeros, batch_metadata = self.quantize(batch_normalized)
+            
+            # Collect results
+            quantized_batches.append(batch_quantized)
+            scales_batches.append(batch_scales)
+            zeros_batches.append(batch_zeros)
+            norms_batches.append(batch_norms.squeeze(-1).to(torch.float16))
+            
+            # Store metadata from first batch
+            if combined_metadata is None:
+                combined_metadata = batch_metadata.copy()
+                combined_metadata["original_shape"] = (num_embeddings, embedding_dim)
+                combined_metadata["num_elements"] = num_embeddings * embedding_dim
+                combined_metadata["num_blocks"] = (num_embeddings * embedding_dim + self.scale_blocks - 1) // self.scale_blocks
+            
+            # Clear batch from memory
+            del batch_embeddings, batch_normalized, batch_norms
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Concatenate all batched results
+        logger.info("Concatenating quantized batches...")
+        quantized_combined = torch.cat(quantized_batches, dim=0)
+        scales_combined = torch.cat(scales_batches, dim=0)
+        zeros_combined = torch.cat(zeros_batches, dim=0)
+        norms_combined = torch.cat(norms_batches, dim=0)
+        
+        # Clean up batch lists
+        del quantized_batches, scales_batches, zeros_batches, norms_batches
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        quant_metadata = {
+            "type": self.quantization_type,
+            "scales": scales_combined,
+            "zeros": zeros_combined,
+            "norms": norms_combined,
+            "metadata": combined_metadata
+        }
+        
+        logger.info(f"Batched quantization completed. Final shape: {quantized_combined.shape}")
+        return quantized_combined, quant_metadata
+    
+    def _quantize_batched(self, embeddings: torch.Tensor, batch_size: int) -> Tuple[torch.Tensor, dict]:
+        """
+        Batch-wise quantization for FP16 and other simple quantization types
+        
+        Args:
+            embeddings: Large embedding matrix to quantize
+            batch_size: Number of embeddings per batch
+            
+        Returns:
+            Tuple of (quantized_embeddings, quantization_metadata)
+        """
+        logger.info(f"Applying batched {self.quantization_type} quantization with batch_size={batch_size}")
+        
+        num_embeddings = embeddings.shape[0]
+        
+        # Lists to collect batched results
+        quantized_batches = []
+        scales_batches = []
+        zeros_batches = []
+        
+        # Keep track of metadata from first batch for consistency
+        combined_metadata = None
+        
+        for i in range(0, num_embeddings, batch_size):
+            end_idx = min(i + batch_size, num_embeddings)
+            batch_embeddings = embeddings[i:end_idx]
+            
+            logger.info(f"Quantizing batch {i//batch_size + 1}/{(num_embeddings + batch_size - 1)//batch_size} "
+                       f"(embeddings {i}-{end_idx-1})")
+            
+            # Quantize this batch
+            batch_quantized, batch_scales, batch_zeros, batch_metadata = self.quantize(batch_embeddings)
+            
+            # Collect results
+            quantized_batches.append(batch_quantized)
+            if batch_scales is not None:
+                scales_batches.append(batch_scales)
+            if batch_zeros is not None:
+                zeros_batches.append(batch_zeros)
+            
+            # Store metadata from first batch
+            if combined_metadata is None:
+                combined_metadata = batch_metadata.copy() if batch_metadata is not None else None
+                if combined_metadata is not None:
+                    combined_metadata["original_shape"] = embeddings.shape
+                    combined_metadata["num_elements"] = embeddings.numel()
+            
+            # Clear batch from memory
+            del batch_embeddings
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Concatenate all batched results
+        logger.info("Concatenating quantized batches...")
+        if self.quantization_type == "FP16":
+            # For FP16, just concatenate the tensors directly
+            quantized_combined = torch.cat(quantized_batches, dim=0)
+            quant_metadata = {
+                "type": self.quantization_type,
+                "scales": None,
+                "zeros": None,
+                "metadata": combined_metadata
+            }
+        else:
+            # For other types, concatenate scales and zeros as well
+            quantized_combined = torch.cat(quantized_batches, dim=0)
+            scales_combined = torch.cat(scales_batches, dim=0) if scales_batches else None
+            zeros_combined = torch.cat(zeros_batches, dim=0) if zeros_batches else None
+            
+            quant_metadata = {
+                "type": self.quantization_type,
+                "scales": scales_combined,
+                "zeros": zeros_combined,
+                "metadata": combined_metadata
+            }
+        
+        # Clean up batch lists
+        del quantized_batches, scales_batches, zeros_batches
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        logger.info(f"Batched quantization completed. Final shape: {quantized_combined.shape}")
+        return quantized_combined, quant_metadata
     
     @staticmethod
     def compute_quantized_similarity_direct(query_embedding: torch.Tensor, 

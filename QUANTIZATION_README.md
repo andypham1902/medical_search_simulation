@@ -11,8 +11,6 @@ The quantization feature is controlled by the following configuration parameters
 USE_EMBEDDING_QUANTIZATION = True  # Enable 4-bit quantization for embeddings
 QUANTIZATION_TYPE = "INT4"  # Options: "INT4", "FP4", "INT8", "FP16", "NONE"
 QUANTIZATION_SCALE_BLOCKS = 64  # Number of elements per quantization block for scaling
-KEEP_EMBEDDINGS_ON_GPU = True  # Keep quantized embeddings on GPU to avoid CPU-GPU transfers
-DEQUANTIZE_FOR_SEARCH = False  # Whether to dequantize before similarity computation
 ```
 
 ## Quantization Types
@@ -57,7 +55,7 @@ This allows fitting all embeddings on a single GPU with 8-16GB memory.
 
 2. **Block-wise Quantization**: Embeddings are quantized in blocks (default 64 elements) with per-block scaling factors to minimize quantization error.
 
-3. **GPU-Optimized Search**: When `KEEP_EMBEDDINGS_ON_GPU=True`, quantized embeddings stay on GPU, eliminating CPU-GPU transfer overhead during search.
+3. **GPU-Optimized Search**: Quantized embeddings are kept on GPU when available, eliminating CPU-GPU transfer overhead during search.
 
 ## Performance Impact
 
@@ -73,7 +71,6 @@ Based on testing with 10,000 embeddings:
 ```python
 USE_EMBEDDING_QUANTIZATION = True
 QUANTIZATION_TYPE = "INT4"
-KEEP_EMBEDDINGS_ON_GPU = True
 ```
 
 2. Start the API server normally:
@@ -102,7 +99,7 @@ This will show:
 
 ## Best Practices
 
-1. **For Maximum Memory Savings**: Use INT4 with `KEEP_EMBEDDINGS_ON_GPU=True`
+1. **For Maximum Memory Savings**: Use INT4
 2. **For Best Accuracy**: Use FP16 or INT8
 3. **For Balanced Approach**: Use INT4 with similarity-aware quantization
 4. **Block Size**: Default 64 works well; larger blocks may improve accuracy slightly but reduce compression

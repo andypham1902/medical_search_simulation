@@ -124,7 +124,6 @@ async def rerank_texts(request: RerankRequest):
         
         # Generate outputs
         outputs = reranker_model.generate(formatted_texts, sampling_params)
-        
         # Calculate scores
         scores = []
         for output in outputs:

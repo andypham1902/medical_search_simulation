@@ -167,6 +167,7 @@ cython_debug/
 .claude-code/
 claude.json
 .clauderc
+CLAUDE.md
 
 # Cursor
 .cursor/
