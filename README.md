@@ -32,6 +32,23 @@ The system consists of three main components:
 - **Batched processing**: Avoids out-of-memory issues during quantization and search
 - **Block-wise quantization**: 64 elements per block for optimal performance
 
+## Quick Start
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd medical_search_simulation
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the API server
+python api.py
+
+# In another terminal, run the stress test
+python stress_test.py --ccu 64 --duration 60
+```
+
 ## Installation
 
 1. Install dependencies:
@@ -40,7 +57,7 @@ pip install -r requirements.txt
 ```
 
 2. Prepare embeddings:
-   - Embeddings are stored at `/your_path/embeddings/`
+   - Embeddings are stored at `/path/to/embeddings/`
    - Files are named `embeddings_0.pt` to `embeddings_3204.pt`
    - Each file contains embeddings for passages from medical papers
    - Total: ~25M embeddings of dimension 4096
@@ -59,7 +76,9 @@ python api.py
 The main API server will start on `http://0.0.0.0:10000` by default.
 The system will automatically start the embedding server (port 10001) and reranker server (port 10002).
 
-## Quick Test
+## Testing
+
+### Quick API Test
 
 Once the server is running, you can test it with these curl commands:
 
@@ -72,7 +91,7 @@ curl http://localhost:10000/health
 ```bash
 curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
-  -d '{"query": "diabetes treatment", "use_reranker": true}'
+  -d '{"query": "diabetes treatment", "top_k": 20, "rerank": true}'
 ```
 
 3. **Visit a specific document** (replace URL with one from search results):
@@ -114,13 +133,15 @@ POST /search
 ```json
 {
     "query": "diabetes treatment guidelines",
-    "use_reranker": true
+    "top_k": 20,
+    "rerank": true
 }
 ```
 
 **Parameters:**
 - `query` (required): Search query text
-- `use_reranker` (optional): Whether to apply reranking (default: true)
+- `top_k` (optional): Number of results to return (default: 20, max: 100)
+- `rerank` (optional): Whether to apply reranking (default: true)
 
 **Example curl command:**
 ```bash
@@ -128,7 +149,8 @@ curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "diabetes treatment guidelines",
-    "use_reranker": true
+    "top_k": 20,
+    "rerank": true
   }'
 ```
 
@@ -138,7 +160,8 @@ curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "cardiovascular risk factors",
-    "use_reranker": false
+    "top_k": 50,
+    "rerank": false
   }'
 ```
 
@@ -218,7 +241,7 @@ curl -X GET "http://localhost:10000/health"
     "reranker_model": true,
     "metadata_dataset": true,
     "embeddings_matrix": true,
-    "embeddings_shape": [4096000, 4096]
+    "embeddings_shape": [2300000, 4096]
   }
 }
 ```
@@ -283,35 +306,46 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 - **RAM**: ~37GB for unquantized embeddings (2.3M embeddings × 4096 dimensions)
 - **RAM with INT4**: ~5GB after quantization (8x compression)
 - **GPU**: 16GB+ VRAM recommended for both embedding and reranking models
+- **Storage**: Embeddings require ~300GB of disk space
 
 ### Optimization Tips
 1. **Use quantization**: INT4 provides 8x memory reduction with minimal quality loss
 2. **Adjust batch sizes**: Increase `SEARCH_BATCH_SIZE` for faster search if GPU memory allows
 3. **GPU allocation**: Distribute embedding and reranking servers across multiple GPUs
-4. **Disable reranking**: Use `use_reranker=false` for faster but less accurate results
+4. **Disable reranking**: Use `rerank=false` for faster but less accurate results
 5. **Monitor startup time**: Initial quantization takes 2-3 minutes but is one-time cost
 6. **Debug mode**: Enable to identify performance bottlenecks
 
 ## Testing
 
-Run the available tests:
-```bash
-# Test quantization quality
-python test_quantization.py
-
-# Test batched quantization functionality  
-python test_batched_quantization.py
-
-# Basic server testing
-python test_server.py
-```
-
-The tests cover:
-- Quantization quality and memory usage
-- Batched processing functionality
-- Server startup and basic functionality
+See the Testing section above for comprehensive testing options including unit tests and stress testing.
 
 ## Troubleshooting
+
+### Stress Testing
+
+The project includes a comprehensive stress testing tool that simulates multiple concurrent users:
+
+```bash
+# Run stress test with 64 concurrent users for 60 seconds
+python stress_test.py --ccu 64 --duration 60
+
+# Run with custom API URL
+python stress_test.py --url http://192.168.0.11:10000 --ccu 64
+
+# Skip pre-flight checks
+python stress_test.py --skip-preflight --ccu 100 --duration 120
+```
+
+The stress test will:
+1. Run pre-flight checks to ensure API health
+2. Test all endpoints (health, search, visit)
+3. Simulate realistic user behavior (70% search, 30% visit)
+4. Report comprehensive metrics including:
+   - Response times (min, max, mean, median, p95, p99)
+   - Success/failure rates
+   - Requests per second
+   - Error breakdown
 
 ### Common Issues
 
@@ -341,15 +375,11 @@ The tests cover:
 ```
 medical_search_simulation/
 ├── api.py                      # Main FastAPI application
-├── embedding_server.py         # VLLM embedding server
-├── reranker_server.py         # VLLM reranking server
+├── cache_utils.py              # Caching utilities for startup
 ├── config.py                  # Configuration settings
 ├── quantization_utils.py      # Embedding quantization utilities
-├── generate_embeddings.py     # Script to generate embeddings
 ├── vllm_generate_emb.py      # Alternative VLLM embedding generation
-├── test_quantization.py      # Quantization quality tests
-├── test_batched_quantization.py  # Batched processing tests
-├── test_server.py            # Basic server tests
+├── stress_test.py            # Comprehensive stress testing tool
 ├── requirements.txt          # Python dependencies
 ```
 

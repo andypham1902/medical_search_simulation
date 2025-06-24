@@ -902,7 +902,7 @@ def get_query_embedding(query: str) -> torch.Tensor:
         }
         
         # Send request to VLLM's OpenAI-compatible embeddings endpoint
-        response = requests.post(url, json=payload, timeout=30)
+        response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()
         
         # Extract embedding from OpenAI-compatible response format

@@ -70,7 +70,7 @@ RERANK_GPU_DEVICES = "4,5,6,7"  # GPU device(s) for reranker server
 
 # Model server specific configurations
 EMBEDDING_TENSOR_PARALLEL_SIZE = 4
-EMBEDDING_GPU_MEMORY_UTILIZATION = 0.2
+EMBEDDING_GPU_MEMORY_UTILIZATION = 0.3
 MAX_MODEL_LEN = 4096  # Maximum sequence length
 
 RERANK_TENSOR_PARALLEL_SIZE = 4
