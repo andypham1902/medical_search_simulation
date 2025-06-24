@@ -22,6 +22,7 @@ import atexit
 import sys
 from quantization_utils import EmbeddingQuantizer
 from cache_utils import StartupDataCache
+from faiss_index_manager import FaissIndexManager
 
 
 # Configure logging
@@ -73,10 +74,13 @@ embeddings_matrix = None  # Single concatenated matrix of all embeddings
 url_content_cache = {}  # Cache for URL content to improve /visit performance
 sampling_params = None  # Will be initialized based on server mode
 
-# Quantization-related variables
+# Quantization-related variables (Legacy - used when FAISS is disabled)
 quantizer = None  # EmbeddingQuantizer instance
 quantized_embeddings = None  # Quantized embeddings (on GPU if configured)
 quantization_metadata = None  # Metadata for dequantization
+
+# FAISS-related variables
+faiss_manager = None  # FaissIndexManager instance
 
 # Cache instance
 startup_cache = None  # StartupDataCache instance
@@ -207,7 +211,7 @@ def get_embid2metadata_id(dataset):
 @app.on_event("startup")
 async def startup_event():
     """Initialize model servers and load data on startup"""
-    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, quantizer, quantized_embeddings, quantization_metadata, startup_cache
+    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, quantizer, quantized_embeddings, quantization_metadata, startup_cache, faiss_manager
 
     start_time = time.time()
     logger.info("Starting initialization...")
@@ -297,7 +301,10 @@ async def startup_event():
             logger.info(f"DEBUG: Metadata loaded in {time.time() - metadata_start_time:.2f} seconds")
             logger.info(f"DEBUG: Total embedding ID to metadata ID mappings: {len(emb_id_to_metadata_id)}")
 
-        # Load embedding files and apply quantization only if not loaded from cache
+        # Initialize FAISS manager (will be setup after embeddings are loaded)
+        faiss_manager = FaissIndexManager(embedding_dimension=config.EMBEDDING_DIMENSION)
+
+        # Load embedding files and apply quantization only if not loaded from cache (Legacy path when FAISS disabled)
         if not cache_loaded:
             embeddings_start_time = time.time()
             logger.info("Loading embedding files in parallel...")
@@ -457,6 +464,52 @@ async def startup_event():
                 
                 if DEBUG_MODE:
                     logger.info(f"DEBUG: All embeddings and quantization completed in {time.time() - embeddings_start_time:.2f} seconds")
+        
+        # Setup FAISS index from the loaded/quantized embeddings
+        logger.info("Setting up FAISS multi-GPU index from embeddings...")
+        faiss_start_time = time.time()
+        
+        # Convert embeddings matrix to numpy for FAISS
+        if embeddings_matrix is not None:
+            # Use original embeddings matrix
+            embeddings_np = embeddings_matrix.cpu().numpy().astype(np.float32)
+        elif quantized_embeddings is not None:
+            # Dequantize embeddings for FAISS (FAISS will handle its own quantization)
+            logger.info("Dequantizing embeddings for FAISS setup...")
+            from quantization_utils import EmbeddingQuantizer
+            if quantization_metadata["type"] in ["INT4", "INT8"] and "norms" in quantization_metadata:
+                # For similarity-aware quantization, dequantize properly
+                embeddings_np = EmbeddingQuantizer.dequantize_similarity_aware(
+                    quantized_embeddings.cpu(),
+                    quantization_metadata
+                ).numpy().astype(np.float32)
+            else:
+                # For other types, convert directly
+                embeddings_np = quantized_embeddings.cpu().to(torch.float32).numpy()
+        else:
+            raise ValueError("No embeddings available for FAISS setup")
+        
+        # Setup FAISS index
+        faiss_manager.setup_index_from_embeddings(
+            embeddings=embeddings_np,
+            index_type=config.FAISS_INDEX_TYPE,
+            nlist=config.FAISS_NLIST,
+            use_cosine=config.FAISS_USE_COSINE,
+            gpu_devices=config.FAISS_GPU_DEVICES,
+            save_path=config.FAISS_INDEX_PATH,
+            load_path=config.FAISS_INDEX_PATH if os.path.exists(config.FAISS_INDEX_PATH) else None
+        )
+        
+        logger.info(f"FAISS setup completed in {time.time() - faiss_start_time:.2f} seconds")
+        logger.info(f"FAISS stats: {faiss_manager.get_stats()}")
+        
+        # Clear original embeddings from memory to save space (FAISS handles them now)
+        if embeddings_matrix is not None:
+            del embeddings_matrix
+            embeddings_matrix = None
+        del embeddings_np
+        torch.cuda.empty_cache()
+        logger.info("Original embeddings cleared after FAISS setup")
         
         # Preload URL content cache only if not loaded from cache
         if not cache_loaded:
@@ -1081,11 +1134,15 @@ async def search(request: SearchRequest):
         )
         
         search_start = time.time()
-        top_matches = search_embeddings_batch(
+        # Use FAISS multi-GPU search
+        logger.info("Using FAISS multi-GPU search...")
+        distances, indices = faiss_manager.search(
             query_embedding,
-            batch_size=getattr(config, "BATCH_SIZE", 1000),
-            top_k=num_candidates,
+            k=min(num_candidates, config.FAISS_SEARCH_K),
+            normalize_query=config.FAISS_USE_COSINE
         )
+        # Convert FAISS results to the expected format: list of (index, score) tuples
+        top_matches = [(indices[0][i], float(distances[0][i])) for i in range(len(indices[0]))]
         if DEBUG_MODE:
             logger.info(f"DEBUG: Embedding search completed in {time.time() - search_start:.3f} seconds, found {len(top_matches)} matches")
 

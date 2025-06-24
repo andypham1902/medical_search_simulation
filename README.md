@@ -4,11 +4,13 @@ A high-performance medical literature search system that uses embedding-based se
 
 ## Features
 
+- **FAISS Multi-GPU Search**: Scalable similarity search across multiple GPUs using FAISS
 - **Fast Semantic Search**: Utilizes Qwen3-Embedding-8B for generating high-quality document embeddings
 - **Advanced Reranking**: Optional reranking with Qwen3-Reranker-8B for improved relevance
+- **GPU Load Balancing**: Distributes embeddings across all available GPUs to eliminate bottlenecks
 - **Memory Optimization**: INT4/INT8/FP16 quantization reduces memory usage by up to 8x
 - **Multi-Server Architecture**: Separate embedding and reranking servers for better resource management
-- **Batch Processing**: Efficient GPU utilization with configurable batch sizes
+- **Index Persistence**: FAISS indexes are saved/loaded for fast startup times
 - **Deduplication**: Returns one result per paper to avoid duplicates
 - **RESTful API**: Simple and intuitive FastAPI interface with automatic documentation
 
@@ -22,15 +24,22 @@ The system consists of three main components:
 ### Data Flow
 1. User sends search query to API
 2. API gets query embedding from embedding server
-3. API performs similarity search on pre-computed embeddings
+3. API performs FAISS multi-GPU similarity search on distributed embeddings
 4. Optionally reranks results using reranker server
 5. Returns deduplicated results (one result per paper)
 
+### FAISS Multi-GPU Architecture
+- **Index Distribution**: Embeddings automatically distributed across all available GPUs
+- **IVFFlat Index**: Inverted File with Flat quantizer for balanced speed/accuracy
+- **Cosine Similarity**: Normalized vectors with Inner Product for optimal similarity search
+- **Index Persistence**: Pre-built indexes saved to disk for fast startup
+- **Auto-scaling**: Automatically utilizes all available GPUs (configurable)
+
 ### Memory Optimization
-- **Default**: INT4 quantization provides 8x compression while preserving search quality
-- **Quantized embeddings**: Kept on GPU when available for fast similarity computation
-- **Batched processing**: Avoids out-of-memory issues during quantization and search
-- **Block-wise quantization**: 64 elements per block for optimal performance
+- **FAISS GPU Management**: Automatic GPU memory allocation and load balancing
+- **Quantization Support**: Compatible with existing INT4/INT8/FP16 quantization
+- **Index Caching**: Pre-built FAISS indexes avoid rebuild time
+- **Memory Efficiency**: Original embeddings cleared after FAISS setup
 
 ## Quick Start
 
@@ -91,7 +100,7 @@ curl http://localhost:10000/health
 ```bash
 curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
-  -d '{"query": "diabetes treatment", "top_k": 20, "rerank": true}'
+  -d '{"query": "diabetes treatment", "use_reranker": true}'
 ```
 
 3. **Visit a specific document** (replace URL with one from search results):
@@ -109,10 +118,10 @@ python api.py --debug
 ```
 
 This will enable comprehensive logging including:
+- FAISS index setup and multi-GPU distribution times
 - Model loading times
-- Embedding batch processing times (CPU to GPU transfer)
 - Query embedding generation time
-- Similarity computation time per batch
+- FAISS similarity search performance
 - Reranking preparation and scoring times
 - Total API response time breakdowns
 
@@ -133,15 +142,13 @@ POST /search
 ```json
 {
     "query": "diabetes treatment guidelines",
-    "top_k": 20,
-    "rerank": true
+    "use_reranker": true
 }
 ```
 
 **Parameters:**
 - `query` (required): Search query text
-- `top_k` (optional): Number of results to return (default: 20, max: 100)
-- `rerank` (optional): Whether to apply reranking (default: true)
+- `use_reranker` (optional): Whether to apply reranking (default: true)
 
 **Example curl command:**
 ```bash
@@ -149,8 +156,7 @@ curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "diabetes treatment guidelines",
-    "top_k": 20,
-    "rerank": true
+    "use_reranker": true
   }'
 ```
 
@@ -160,8 +166,7 @@ curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "cardiovascular risk factors",
-    "top_k": 50,
-    "rerank": false
+    "use_reranker": false
   }'
 ```
 

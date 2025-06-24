@@ -26,6 +26,14 @@ BATCH_SIZE = 65536  # Batch size for GPU processing during search
 USE_GPU_PRELOADING = True  # Enable GPU preloading for better pipeline efficiency
 PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
 
+# FAISS Configuration
+FAISS_INDEX_TYPE = "IVFFlat"  # Options: "Flat", "IVFFlat", "IVFPQ"
+FAISS_NLIST = 1024  # Number of clusters for IVF indexes
+FAISS_USE_COSINE = True  # Use cosine similarity (normalized vectors with IP)
+FAISS_GPU_DEVICES = [0, 1, 2, 3, 4, 5, 6, 7]  # GPU devices for FAISS
+FAISS_INDEX_PATH = "/mnt/sharefs/tuenv/medical_search_cache/faiss_index.bin"  # Path to save/load FAISS index
+FAISS_SEARCH_K = 1000  # Initial k for FAISS search before reranking
+
 # Embedding Quantization Configuration
 USE_EMBEDDING_QUANTIZATION = True  # Enable 4-bit quantization for embeddings
 QUANTIZATION_TYPE = "INT4"  # Options: "INT4", "FP4", "INT8", "FP16", "NONE"
