@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+Comprehensive stress testing tool for Medical Search Simulation API
+Tests FAISS multi-GPU search performance with pre-flight checks and detailed metrics
+"""
 import asyncio
 import aiohttp
 import time
@@ -95,7 +99,31 @@ class StressTest:
                     if response.status == 200:
                         data = await response.json()
                         print("✅ Health check passed")
-                        print(f"   Models loaded: {data.get('models_loaded', 'Unknown')}")
+                        
+                        # Check server status
+                        servers = data.get('servers', {})
+                        embedding_healthy = servers.get('embedding_server', {}).get('healthy', False)
+                        reranker_healthy = servers.get('reranker_server', {}).get('healthy', False)
+                        print(f"   Embedding server: {'✅' if embedding_healthy else '❌'}")
+                        print(f"   Reranker server: {'✅' if reranker_healthy else '❌'}")
+                        
+                        # Check data loading status
+                        data_loaded = data.get('data_loaded', {})
+                        metadata_loaded = data_loaded.get('metadata_dataset', False)
+                        embeddings_shape = data_loaded.get('embeddings_shape')
+                        print(f"   Metadata loaded: {'✅' if metadata_loaded else '❌'}")
+                        if embeddings_shape:
+                            print(f"   Embeddings shape: {embeddings_shape}")
+                        
+                        # Check FAISS status (if available)
+                        cache_stats = data.get('cache_statistics', {})
+                        if cache_stats:
+                            url_cache_size = cache_stats.get('url_content_cache_size', 0)
+                            print(f"   URL cache entries: {url_cache_size:,}")
+                        
+                        if not (embedding_healthy and reranker_healthy and metadata_loaded):
+                            print("❌ Some components are not ready")
+                            return False
                     else:
                         print(f"❌ Health check failed: HTTP {response.status}")
                         return False
@@ -111,7 +139,7 @@ class StressTest:
             print("\n🔍 Testing search endpoint...")
             test_query = "diabetes treatment"
             try:
-                payload = {"query": test_query, "top_k": 5}
+                payload = {"query": test_query, "use_reranker": False}
                 async with session.post(f"{self.base_url}/search", json=payload) as response:
                     if response.status == 200:
                         data = await response.json()
