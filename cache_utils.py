@@ -24,10 +24,8 @@ class StartupDataCache:
         
         # Cache file paths
         self.emb_id_mapping_file = self.cache_dir / "emb_id_to_metadata_id.pkl"
-        self.quantized_embeddings_file = self.cache_dir / "quantized_embeddings.pt"
-        self.quantization_metadata_file = self.cache_dir / "quantization_metadata.pkl"
         self.url_content_cache_file = self.cache_dir / "url_content_cache.pkl"
-        self.cache_info_file = self.cache_dir / "cache_info.json"
+        self.cache_info_file = self.cache_dir / "cache_info_new.json"
         
         logger.info(f"Cache directory: {self.cache_dir}")
     
@@ -55,9 +53,6 @@ class StartupDataCache:
             'EMBEDDING_FOLDER': config.EMBEDDING_FOLDER,
             'MAX_EMBEDDING_FILES': config.MAX_EMBEDDING_FILES,
             'METADATA_DATASET_NAME': config.METADATA_DATASET_NAME,
-            'USE_EMBEDDING_QUANTIZATION': config.USE_EMBEDDING_QUANTIZATION,
-            'QUANTIZATION_TYPE': config.QUANTIZATION_TYPE,
-            'QUANTIZATION_SCALE_BLOCKS': config.QUANTIZATION_SCALE_BLOCKS,
             'EMBEDDING_DIMENSION': config.EMBEDDING_DIMENSION,
             'DEBUG_MODE': config.DEBUG_MODE
         }
@@ -69,6 +64,7 @@ class StartupDataCache:
         try:
             cache_info = self._get_cache_info()
             current_config_hash = self._get_config_hash()
+
             
             # Check if config has changed
             if cache_info.get('config_hash') != current_config_hash:
@@ -80,13 +76,6 @@ class StartupDataCache:
                 self.emb_id_mapping_file,
                 self.url_content_cache_file
             ]
-            
-            # Only check quantized files if quantization is enabled
-            if config.USE_EMBEDDING_QUANTIZATION and config.QUANTIZATION_TYPE != "NONE":
-                required_files.extend([
-                    self.quantized_embeddings_file,
-                    self.quantization_metadata_file
-                ])
             
             for file_path in required_files:
                 if not file_path.exists():
@@ -135,50 +124,7 @@ class StartupDataCache:
             logger.error(f"Failed to load embedding ID mapping: {e}")
         return None
     
-    def save_quantized_embeddings(self, quantized_embeddings: torch.Tensor, quantization_metadata: Dict[str, Any]):
-        """Save quantized embeddings and metadata"""
-        try:
-            logger.info(f"Saving quantized embeddings (shape: {quantized_embeddings.shape})")
-            
-            # Save embeddings tensor
-            torch.save(quantized_embeddings.cpu(), self.quantized_embeddings_file)
-            
-            # Save quantization metadata (move tensors to CPU first)
-            metadata_cpu = {}
-            for key, value in quantization_metadata.items():
-                if isinstance(value, torch.Tensor):
-                    metadata_cpu[key] = value.cpu()
-                else:
-                    metadata_cpu[key] = value
-            
-            with open(self.quantization_metadata_file, 'wb') as f:
-                pickle.dump(metadata_cpu, f, protocol=pickle.HIGHEST_PROTOCOL)
-            
-            logger.info(f"Saved quantized embeddings to {self.quantized_embeddings_file}")
-            logger.info(f"Saved quantization metadata to {self.quantization_metadata_file}")
-            
-        except Exception as e:
-            logger.error(f"Failed to save quantized embeddings: {e}")
-    
-    def load_quantized_embeddings(self) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, Any]]]:
-        """Load quantized embeddings and metadata"""
-        try:
-            if self.quantized_embeddings_file.exists() and self.quantization_metadata_file.exists():
-                logger.info("Loading quantized embeddings from cache")
-                
-                # Load embeddings
-                quantized_embeddings = torch.load(self.quantized_embeddings_file, map_location='cpu')
-                
-                # Load metadata
-                with open(self.quantization_metadata_file, 'rb') as f:
-                    quantization_metadata = pickle.load(f)
-                
-                logger.info(f"Loaded quantized embeddings (shape: {quantized_embeddings.shape})")
-                return quantized_embeddings, quantization_metadata
-                
-        except Exception as e:
-            logger.error(f"Failed to load quantized embeddings: {e}")
-        return None, None
+    # Quantization cache methods removed - FAISS handles quantization internally
     
     def save_url_content_cache(self, url_content_cache: Dict[str, str]):
         """Save URL content cache"""
@@ -210,17 +156,12 @@ class StartupDataCache:
             logger.error(f"Failed to load URL content cache: {e}")
         return None
     
-    def save_all_cache_data(self, emb_id_to_metadata_id: Dict[int, int], 
-                           quantized_embeddings: Optional[torch.Tensor] = None,
-                           quantization_metadata: Optional[Dict[str, Any]] = None,
-                           url_content_cache: Optional[Dict[str, str]] = None):
-        """Save all cache data and update cache info"""
+    def save_cache_data(self, emb_id_to_metadata_id: Dict[int, int], 
+                       url_content_cache: Optional[Dict[str, str]] = None):
+        """Save cache data and update cache info"""
         try:
             # Save individual components
             self.save_emb_id_mapping(emb_id_to_metadata_id)
-            
-            if quantized_embeddings is not None and quantization_metadata is not None:
-                self.save_quantized_embeddings(quantized_embeddings, quantization_metadata)
             
             if url_content_cache is not None:
                 self.save_url_content_cache(url_content_cache)
@@ -229,8 +170,6 @@ class StartupDataCache:
             cache_info = {
                 'timestamp': int(os.path.getmtime(self.emb_id_mapping_file)),
                 'config_hash': self._get_config_hash(),
-                'quantization_enabled': config.USE_EMBEDDING_QUANTIZATION and config.QUANTIZATION_TYPE != "NONE",
-                'quantization_type': config.QUANTIZATION_TYPE if config.USE_EMBEDDING_QUANTIZATION else "NONE",
                 'debug_mode': config.DEBUG_MODE
             }
             self._save_cache_info(cache_info)
@@ -240,35 +179,26 @@ class StartupDataCache:
         except Exception as e:
             logger.error(f"Failed to save cache data: {e}")
     
-    def load_all_cache_data(self) -> Tuple[Optional[Dict[int, int]], 
-                                         Optional[torch.Tensor], 
-                                         Optional[Dict[str, Any]], 
-                                         Optional[Dict[str, str]]]:
-        """Load all cached data"""
+    def load_cache_data(self) -> Tuple[Optional[Dict[int, int]], Optional[Dict[str, str]]]:
+        """Load cached data"""
         if not self.is_cache_valid():
             logger.info("Cache is invalid, will not load")
-            return None, None, None, None
+            return None, None
         
         try:
-            logger.info("Loading all data from cache")
+            logger.info("Loading data from cache")
             
             # Load mapping
             emb_id_mapping = self.load_emb_id_mapping()
             
-            # Load quantized embeddings if enabled
-            quantized_embeddings = None
-            quantization_metadata = None
-            if config.USE_EMBEDDING_QUANTIZATION and config.QUANTIZATION_TYPE != "NONE":
-                quantized_embeddings, quantization_metadata = self.load_quantized_embeddings()
-            
             # Load URL content cache
             url_content_cache = self.load_url_content_cache()
             
-            return emb_id_mapping, quantized_embeddings, quantization_metadata, url_content_cache
+            return emb_id_mapping, url_content_cache
             
         except Exception as e:
             logger.error(f"Failed to load cache data: {e}")
-            return None, None, None, None
+            return None, None
     
     def clear_cache(self):
         """Clear all cached files"""

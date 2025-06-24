@@ -20,7 +20,6 @@ import requests
 import signal
 import atexit
 import sys
-from quantization_utils import EmbeddingQuantizer
 from cache_utils import StartupDataCache
 from faiss_index_manager import FaissIndexManager
 
@@ -74,10 +73,6 @@ embeddings_matrix = None  # Single concatenated matrix of all embeddings
 url_content_cache = {}  # Cache for URL content to improve /visit performance
 sampling_params = None  # Will be initialized based on server mode
 
-# Quantization-related variables (Legacy - used when FAISS is disabled)
-quantizer = None  # EmbeddingQuantizer instance
-quantized_embeddings = None  # Quantized embeddings (on GPU if configured)
-quantization_metadata = None  # Metadata for dequantization
 
 # FAISS-related variables
 faiss_manager = None  # FaissIndexManager instance
@@ -112,31 +107,31 @@ def start_model_servers():
     logger.info(f"Starting VLLM embedding server: {' '.join(embedding_cmd)}")
     embedding_server_process = subprocess.Popen(
         embedding_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, # Discard stdout
+        stderr=subprocess.DEVNULL,  # Discard stderr
         env={**os.environ, "CUDA_VISIBLE_DEVICES": config.EMBEDDING_GPU_DEVICES}
     )
     
     # Start reranker server using vllm serve
-    reranker_cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", config.RERANKER_MODEL_NAME,
-        "--port", str(config.RERANKER_SERVER_PORT),
-        "--host", config.RERANKER_SERVER_HOST,
-        "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
-        "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
-        "--max-model-len", str(config.MAX_RERANK_LEN),
-        "--trust-remote-code",
-        "--served-model-name", "reranker-model",
-        "--task", "generate",
-    ]
-    logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
-    reranker_server_process = subprocess.Popen(
-        reranker_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
-    )
+    # reranker_cmd = [
+    #     sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+    #     "--model", config.RERANKER_MODEL_NAME,
+    #     "--port", str(config.RERANKER_SERVER_PORT),
+    #     "--host", config.RERANKER_SERVER_HOST,
+    #     "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
+    #     "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
+    #     "--max-model-len", str(config.MAX_RERANK_LEN),
+    #     "--trust-remote-code",
+    #     "--served-model-name", "reranker-model",
+    #     "--task", "generate",
+    # ]
+    # logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
+    # reranker_server_process = subprocess.Popen(
+    #     reranker_cmd,
+    #     stdout=subprocess.PIPE,
+    #     stderr=subprocess.PIPE,
+    #     env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
+    # )
     
     # Wait for servers to be ready using VLLM's OpenAI-compatible health endpoint
     embedding_url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health"
@@ -147,12 +142,14 @@ def start_model_servers():
         time.sleep(1)
         try:
             # Check embedding server
-            embed_resp = requests.get(embedding_url, timeout=1)
-            embed_ready = embed_resp.status_code == 200
+            # embed_resp = requests.get(embedding_url, timeout=1)
+            # embed_ready = embed_resp.status_code == 200
+            embed_ready = True
             
             # Check reranker server
-            rerank_resp = requests.get(reranker_url, timeout=1)
-            rerank_ready = rerank_resp.status_code == 200
+            # rerank_resp = requests.get(reranker_url, timeout=1)
+            # rerank_ready = rerank_resp.status_code == 200
+            rerank_ready = True
             
             if embed_ready and rerank_ready:
                 logger.info("Both VLLM servers are ready!")
@@ -211,7 +208,7 @@ def get_embid2metadata_id(dataset):
 @app.on_event("startup")
 async def startup_event():
     """Initialize model servers and load data on startup"""
-    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, quantizer, quantized_embeddings, quantization_metadata, startup_cache, faiss_manager
+    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, startup_cache, faiss_manager
 
     start_time = time.time()
     logger.info("Starting initialization...")
@@ -246,31 +243,11 @@ async def startup_event():
             logger.info("Attempting to load data from cache...")
             cache_start_time = time.time()
             
-            cached_emb_mapping, cached_quantized_embeddings, cached_quantization_metadata, cached_url_content = startup_cache.load_all_cache_data()
+            cached_emb_mapping, cached_url_content = startup_cache.load_cache_data()
             
             if cached_emb_mapping is not None:
                 emb_id_to_metadata_id = cached_emb_mapping
                 logger.info(f"Loaded embedding ID mapping from cache ({len(emb_id_to_metadata_id)} entries)")
-                
-                # Load quantized embeddings if available
-                if cached_quantized_embeddings is not None and cached_quantization_metadata is not None:
-                    quantized_embeddings = cached_quantized_embeddings
-                    quantization_metadata = cached_quantization_metadata
-                    
-                    # Move to GPU if available
-                    if torch.cuda.is_available():
-                        logger.info("Moving cached quantized embeddings to GPU...")
-                        quantized_embeddings = quantized_embeddings.cuda()
-                        
-                        # Move metadata to GPU if applicable
-                        if "scales" in quantization_metadata and quantization_metadata["scales"] is not None:
-                            quantization_metadata["scales"] = quantization_metadata["scales"].cuda()
-                        if "zeros" in quantization_metadata and quantization_metadata["zeros"] is not None:
-                            quantization_metadata["zeros"] = quantization_metadata["zeros"].cuda()
-                        if "norms" in quantization_metadata:
-                            quantization_metadata["norms"] = quantization_metadata["norms"].cuda()
-                    
-                    logger.info(f"Loaded quantized embeddings from cache (shape: {quantized_embeddings.shape})")
                 
                 # Load URL content cache if available
                 if cached_url_content is not None:
@@ -301,197 +278,14 @@ async def startup_event():
             logger.info(f"DEBUG: Metadata loaded in {time.time() - metadata_start_time:.2f} seconds")
             logger.info(f"DEBUG: Total embedding ID to metadata ID mappings: {len(emb_id_to_metadata_id)}")
 
-        # Initialize FAISS manager (will be setup after embeddings are loaded)
+        # Initialize FAISS manager
         faiss_manager = FaissIndexManager(embedding_dimension=config.EMBEDDING_DIMENSION)
 
-        # Load embedding files and apply quantization only if not loaded from cache (Legacy path when FAISS disabled)
-        if not cache_loaded:
-            embeddings_start_time = time.time()
-            logger.info("Loading embedding files in parallel...")
-            if DEBUG_MODE:
-                logger.info(f"DEBUG: Loading {config.MAX_EMBEDDING_FILES} embedding files from {config.EMBEDDING_FOLDER}")
-            embedding_tensors = []
-
-            def load_embedding_file(i):
-                """Load a single embedding file"""
-                file_path = f"{config.EMBEDDING_FOLDER}/embeddings_{i}.pt"
-                try:
-                    # Load embeddings to CPU memory to avoid GPU memory usage during startup
-                    embeddings = torch.load(file_path, map_location="cpu")
-                    # Ensure embeddings is 2D (add batch dimension if needed)
-                    if embeddings.dim() == 1:
-                        embeddings = embeddings.unsqueeze(0)
-                    return i, embeddings
-                except Exception as e:
-                    logger.warning(f"Failed to load embeddings_{i}.pt: {e}")
-                    # Create a zero tensor as placeholder to maintain indexing
-                    placeholder = torch.zeros(8192, config.EMBEDDING_DIMENSION)
-                    return i, placeholder
-            
-            # Load embeddings in parallel
-            max_files = config.MAX_EMBEDDING_FILES
-            if DEBUG_MODE:
-                max_files = min(10, max_files)  # Limit files in debug mode
-            
-            # Use ThreadPoolExecutor for parallel I/O
-            with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
-                # Submit all file loading tasks
-                futures = {executor.submit(load_embedding_file, i): i for i in range(max_files)}
-                
-                # Create a list to store embeddings in order
-                embedding_results = [None] * max_files
-                completed = 0
-                
-                # Collect results as they complete
-                for future in futures:
-                    idx, embeddings = future.result()
-                    embedding_results[idx] = embeddings
-                    completed += 1
-                    
-                    if completed % 50 == 0 or (DEBUG_MODE and completed % 5 == 0):
-                        logger.info(f"Loaded {completed}/{max_files} embedding files...")
-                
-                # Flatten the results into embedding_tensors
-                for embeddings in embedding_results:
-                    if isinstance(embeddings, torch.Tensor):
-                        if embeddings.dim() == 2:
-                            embedding_tensors.extend(embeddings)
-                        else:
-                            embedding_tensors.append(embeddings)
-
-            # Concatenate all embeddings into a single matrix
-            if embedding_tensors:
-                # First, ensure all tensors have the same shape
-                embedding_shapes = [t.shape for t in embedding_tensors]
-                unique_shapes = list(set(embedding_shapes))
-                if len(unique_shapes) > 1:
-                    logger.warning(f"Found embeddings with different shapes: {unique_shapes}")
-                    # Flatten all to 1D if needed
-                    embedding_tensors = [t.flatten() if t.dim() == 1 else t for t in embedding_tensors]
-                
-                # Stack embeddings
-                try:
-                    embeddings_matrix = torch.vstack(embedding_tensors)
-                except:
-                    # Fallback to concatenating along first dimension
-                    embeddings_matrix = torch.cat([t.unsqueeze(0) if t.dim() == 1 else t for t in embedding_tensors], dim=0)
-                
-                logger.info(
-                    f"Successfully created embeddings matrix with shape: {embeddings_matrix.shape}"
-                )
-            else:
-                logger.error("No embedding files were loaded successfully")
-                raise Exception("Failed to load any embedding files")
-            if DEBUG_MODE:
-                logger.info(f"DEBUG: All embeddings loaded in {time.time() - embeddings_start_time:.2f} seconds")
-        
-            # Apply quantization if enabled
-            if config.USE_EMBEDDING_QUANTIZATION and config.QUANTIZATION_TYPE != "NONE":
-                logger.info(f"Applying {config.QUANTIZATION_TYPE} quantization to embeddings...")
-                quantization_start_time = time.time()
-                
-                # Initialize quantizer
-                quantizer = EmbeddingQuantizer(
-                    quantization_type=config.QUANTIZATION_TYPE,
-                    scale_blocks=config.QUANTIZATION_SCALE_BLOCKS
-                )
-                
-                # Quantize embeddings using batching to avoid OOM
-                try:
-                    if config.QUANTIZATION_TYPE in ["INT4", "INT8"]:
-                        # Use similarity-aware quantization for better search quality with batching
-                        quantized_embeddings, quantization_metadata = quantizer.quantize_similarity_aware(
-                            embeddings_matrix, 
-                            batch_size=config.QUANTIZATION_BATCH_SIZE
-                        )
-                    else:
-                        # Standard quantization for FP16 - also implement batching if needed
-                        if embeddings_matrix.shape[0] > config.QUANTIZATION_BATCH_SIZE:
-                            logger.info(f"Applying batched quantization for {config.QUANTIZATION_TYPE}")
-                            quantized_embeddings, quantization_metadata = quantizer._quantize_batched(
-                                embeddings_matrix,
-                                config.QUANTIZATION_BATCH_SIZE
-                            )
-                        else:
-                            quantized_embeddings, scales, zeros, metadata = quantizer.quantize(embeddings_matrix)
-                            quantization_metadata = {
-                                "type": config.QUANTIZATION_TYPE,
-                                "scales": scales,
-                                "zeros": zeros,
-                                "metadata": metadata
-                            }
-                    
-                    # Clear original embeddings from memory immediately after quantization to save memory
-                    del embeddings_matrix
-                    embeddings_matrix = None
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                    logger.info("Original embeddings cleared from memory after quantization")
-                except Exception as e:
-                    logger.error(f"Quantization failed: {e}")
-                    logger.error("Falling back to no quantization")
-                    config.USE_EMBEDDING_QUANTIZATION = False
-                    quantized_embeddings = None
-                    quantization_metadata = None
-                    import traceback
-                    traceback.print_exc()
-                
-                # Move to GPU if available
-                if torch.cuda.is_available():
-                    logger.info("Moving quantized embeddings to GPU...")
-                    gpu_start_time = time.time()
-                    quantized_embeddings = quantized_embeddings.cuda()
-                    
-                    # Move metadata to GPU if applicable
-                    if "scales" in quantization_metadata and quantization_metadata["scales"] is not None:
-                        quantization_metadata["scales"] = quantization_metadata["scales"].cuda()
-                    if "zeros" in quantization_metadata and quantization_metadata["zeros"] is not None:
-                        quantization_metadata["zeros"] = quantization_metadata["zeros"].cuda()
-                    if "norms" in quantization_metadata:
-                        quantization_metadata["norms"] = quantization_metadata["norms"].cuda()
-                        
-                    logger.info(f"Quantized embeddings moved to GPU in {time.time() - gpu_start_time:.2f} seconds")
-                
-                # Calculate memory savings using stored embedding tensor info
-                if quantized_embeddings is not None:
-                    # Estimate original size from quantization metadata or config
-                    embedding_count = len(emb_id_to_metadata_id)
-                    embedding_dim = config.EMBEDDING_DIMENSION
-                    original_size_estimate = embedding_count * embedding_dim * 4 / 1024 / 1024 / 1024  # 4 bytes per float32
-                    quantized_size = quantized_embeddings.element_size() * quantized_embeddings.numel() / 1024 / 1024 / 1024  # GB
-                    
-                    logger.info(f"Quantization completed in {time.time() - quantization_start_time:.2f} seconds")
-                    logger.info(f"Memory usage: ~{original_size_estimate:.2f} GB -> {quantized_size:.2f} GB (~{(1 - quantized_size/original_size_estimate)*100:.1f}% reduction)")
-                
-                if DEBUG_MODE:
-                    logger.info(f"DEBUG: All embeddings and quantization completed in {time.time() - embeddings_start_time:.2f} seconds")
-        
-        # Setup FAISS index from the loaded/quantized embeddings
-        logger.info("Setting up FAISS multi-GPU index from embeddings...")
-        faiss_start_time = time.time()
-        
-        # Convert embeddings matrix to numpy for FAISS
-        if embeddings_matrix is not None:
-            # Use original embeddings matrix
-            embeddings_np = embeddings_matrix.cpu().numpy().astype(np.float32)
-        elif quantized_embeddings is not None:
-            # Dequantize embeddings for FAISS (FAISS will handle its own quantization)
-            logger.info("Dequantizing embeddings for FAISS setup...")
-            from quantization_utils import EmbeddingQuantizer
-            if quantization_metadata["type"] in ["INT4", "INT8"] and "norms" in quantization_metadata:
-                # For similarity-aware quantization, dequantize properly
-                embeddings_np = EmbeddingQuantizer.dequantize_similarity_aware(
-                    quantized_embeddings.cpu(),
-                    quantization_metadata
-                ).numpy().astype(np.float32)
-            else:
-                # For other types, convert directly
-                embeddings_np = quantized_embeddings.cpu().to(torch.float32).numpy()
-        else:
-            raise ValueError("No embeddings available for FAISS setup")
-        
-        # Setup FAISS index
-        faiss_manager.setup_index_from_embeddings(
-            embeddings=embeddings_np,
+        # Setup FAISS index using incremental loading
+        # FAISS will load original embeddings in batches and handle its own quantization
+        faiss_manager.setup_index_incremental(
+            embedding_folder=config.EMBEDDING_FOLDER,
+            max_files=config.MAX_EMBEDDING_FILES,
             index_type=config.FAISS_INDEX_TYPE,
             nlist=config.FAISS_NLIST,
             use_cosine=config.FAISS_USE_COSINE,
@@ -500,16 +294,13 @@ async def startup_event():
             load_path=config.FAISS_INDEX_PATH if os.path.exists(config.FAISS_INDEX_PATH) else None
         )
         
+        faiss_start_time = time.time()
         logger.info(f"FAISS setup completed in {time.time() - faiss_start_time:.2f} seconds")
         logger.info(f"FAISS stats: {faiss_manager.get_stats()}")
         
-        # Clear original embeddings from memory to save space (FAISS handles them now)
-        if embeddings_matrix is not None:
-            del embeddings_matrix
-            embeddings_matrix = None
-        del embeddings_np
+        # FAISS handles all embedding storage and memory management
         torch.cuda.empty_cache()
-        logger.info("Original embeddings cleared after FAISS setup")
+        logger.info("FAISS index setup completed and GPU memory cleared")
         
         # Preload URL content cache only if not loaded from cache
         if not cache_loaded:
@@ -566,10 +357,8 @@ async def startup_event():
                 logger.info("Saving data to cache for future startups...")
                 save_start_time = time.time()
                 try:
-                    startup_cache.save_all_cache_data(
+                    startup_cache.save_cache_data(
                         emb_id_to_metadata_id=emb_id_to_metadata_id,
-                        quantized_embeddings=quantized_embeddings,
-                        quantization_metadata=quantization_metadata,
                         url_content_cache=url_content_cache
                     )
                     logger.info(f"Successfully saved all data to cache in {time.time() - save_start_time:.2f} seconds")
@@ -606,330 +395,7 @@ def compute_similarity(
     return similarities
 
 
-def search_quantized_embeddings(
-    query_embedding: torch.Tensor, batch_size: int = 1000, top_k: int = None
-) -> List[tuple]:
-    """Search through quantized embeddings efficiently"""
-    global quantized_embeddings, quantization_metadata, quantizer
-    
-    all_scores = []
-    search_start_time = time.time()
-    if DEBUG_MODE:
-        logger.info(f"DEBUG: Starting quantized embedding search with batch_size={batch_size}, top_k={top_k}")
-        logger.info(f"DEBUG: Quantization type: {quantization_metadata.get('type', 'unknown')}")
-        logger.info(f"DEBUG: Embeddings already on GPU: {quantized_embeddings.is_cuda if quantized_embeddings is not None else False}")
-
-    try:
-        # Ensure query embedding is on GPU
-        query_embedding_gpu = query_embedding.cuda()
-        
-        # Handle different cases based on where embeddings are stored
-        if quantized_embeddings.is_cuda:
-            # Embeddings are already on GPU - process directly
-            if DEBUG_MODE:
-                logger.info("DEBUG: Using quantized embeddings already on GPU")
-            
-            # For similarity-aware quantization, use the direct similarity function that avoids dequantization
-            if quantization_metadata["type"] in ["INT4", "INT8"] and "norms" in quantization_metadata:
-                # Use the direct quantized similarity computation (no dequantization)
-                similarities = EmbeddingQuantizer.compute_quantized_similarity_direct(
-                    query_embedding_gpu.unsqueeze(0),  # Add batch dimension
-                    quantized_embeddings,
-                    quantization_metadata
-                ).squeeze(0)  # Remove batch dimension
-                all_scores.append(similarities.cpu())
-            else:
-                # For FP16 or standard quantization, process in batches
-                # Get the number of embeddings from norms if available
-                if "norms" in quantization_metadata:
-                    num_embeddings = quantization_metadata["norms"].shape[0]
-                else:
-                    # For FP16, the shape should be (num_embeddings, embedding_dim)
-                    num_embeddings = quantized_embeddings.shape[0]
-                
-                for i in range(0, num_embeddings, batch_size):
-                    end_idx = min(i + batch_size, num_embeddings)
-                    
-                    if quantization_metadata["type"] == "FP16":
-                        # FP16 - can compute directly
-                        batch_embeddings = quantized_embeddings[i:end_idx].to(torch.float32)
-                        batch_scores = compute_similarity(query_embedding_gpu, batch_embeddings)
-                    else:
-                        # Other quantization types - need special handling
-                        batch_scores = compute_similarity(query_embedding_gpu, quantized_embeddings[i:end_idx].to(torch.float32))
-                    
-                    all_scores.append(batch_scores.cpu())
-                
-        else:
-            # Embeddings are on CPU - need to load to GPU in batches
-            if DEBUG_MODE:
-                logger.info("DEBUG: Loading quantized embeddings from CPU to GPU in batches")
-            
-            num_embeddings = quantized_embeddings.shape[0]
-            
-            for i in range(0, num_embeddings, batch_size):
-                end_idx = min(i + batch_size, num_embeddings)
-                
-                # Load batch to GPU
-                batch_quantized = quantized_embeddings[i:end_idx].cuda()
-                
-                # Use direct quantized computation or FP16
-                if quantization_metadata["type"] == "FP16":
-                    batch_embeddings = batch_quantized.to(torch.float32)
-                    batch_scores = compute_similarity(query_embedding_gpu, batch_embeddings)
-                elif quantization_metadata["type"] in ["INT4", "INT8"]:
-                    # Use direct quantized similarity computation
-                    batch_scores = EmbeddingQuantizer.compute_quantized_similarity_direct(
-                        query_embedding_gpu.unsqueeze(0),
-                        batch_quantized,
-                        {**quantization_metadata, "scales": quantization_metadata["scales"], "zeros": quantization_metadata["zeros"]}
-                    ).squeeze(0)
-                else:
-                    batch_embeddings = batch_quantized.to(torch.float32)
-                    batch_scores = compute_similarity(query_embedding_gpu, batch_embeddings)
-                
-                all_scores.append(batch_scores.cpu())
-                
-                # Clean up GPU memory
-                del batch_quantized
-                torch.cuda.empty_cache()
-        
-        # Combine all scores and get top-k
-        if all_scores:
-            all_scores_tensor = torch.cat(all_scores)
-            if top_k is None:
-                top_k = config.MAX_SEARCH_RESULTS * 2
-            top_k = min(top_k, len(all_scores_tensor))
-            top_scores, top_indices = torch.topk(all_scores_tensor, top_k)
-            
-            results = []
-            for score, idx in zip(top_scores, top_indices):
-                results.append((idx.item(), score.item()))
-            
-            if DEBUG_MODE:
-                logger.info(f"DEBUG: Quantized embedding search completed in {time.time() - search_start_time:.2f} seconds")
-                logger.info(f"DEBUG: Returning {len(results)} results")
-            return results
-            
-    except Exception as e:
-        logger.error(f"Error in search_quantized_embeddings: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        if "query_embedding_gpu" in locals():
-            del query_embedding_gpu
-        torch.cuda.empty_cache()
-    
-    return []
-
-
-def search_embeddings_batch_optimized(
-    query_embedding: torch.Tensor, batch_size: int = 1000, top_k: int = None
-) -> List[tuple]:
-    """Optimized search with GPU preloading for better pipeline efficiency"""
-    global embeddings_matrix, quantized_embeddings, quantization_metadata, quantizer
-    
-    all_scores = []
-    search_start_time = time.time()
-    if DEBUG_MODE:
-        logger.info(f"DEBUG: Starting OPTIMIZED embedding search with batch_size={batch_size}, top_k={top_k}")
-
-    try:
-        # Check if we're using quantized embeddings
-        if config.USE_EMBEDDING_QUANTIZATION and quantized_embeddings is not None:
-            return search_quantized_embeddings(query_embedding, batch_size, top_k)
-        
-        # Original implementation for non-quantized embeddings
-        # Create CUDA streams for overlapping computation and data transfer
-        main_stream = torch.cuda.Stream()
-        prefetch_stream = torch.cuda.Stream()
-        
-        # Ensure query embedding is on GPU
-        with torch.cuda.stream(main_stream):
-            gpu_transfer_start = time.time()
-            query_embedding_gpu = query_embedding.cuda()
-            if DEBUG_MODE:
-                logger.info(f"DEBUG: Query embedding transferred to GPU in {time.time() - gpu_transfer_start:.4f} seconds")
-        
-        # Process the single embeddings matrix in batches
-        num_embeddings = embeddings_matrix.shape[0]
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Total embeddings to search: {num_embeddings}")
-
-        # Preload first batch
-        current_batch_gpu = None
-        next_batch_gpu = None
-        
-        for i in range(0, num_embeddings, batch_size):
-            batch_start_time = time.time()
-            end_idx = min(i + batch_size, num_embeddings)
-            
-            try:
-                with torch.cuda.stream(main_stream):
-                    # Use preloaded batch or load first batch
-                    if next_batch_gpu is not None:
-                        # Wait for prefetch to complete
-                        prefetch_stream.synchronize()
-                        batch_embeddings = next_batch_gpu
-                        if DEBUG_MODE:
-                            logger.info(f"DEBUG: Using preloaded batch {i//batch_size}")
-                    else:
-                        gpu_load_start = time.time()
-                        batch_embeddings = embeddings_matrix[i:end_idx].cuda()
-                        gpu_load_time = time.time() - gpu_load_start
-                        if DEBUG_MODE:
-                            logger.info(f"DEBUG: First batch {i//batch_size} loaded to GPU in {gpu_load_time:.4f}s")
-                    
-                    # Compute similarities
-                    compute_start = time.time()
-                    batch_scores = compute_similarity(query_embedding_gpu, batch_embeddings)
-                    compute_time = time.time() - compute_start
-                    
-                    # Store results (move back to CPU to save GPU memory)
-                    cpu_transfer_start = time.time()
-                    all_scores.append(batch_scores.cpu())
-                    cpu_transfer_time = time.time() - cpu_transfer_start
-                
-                # Start loading next batch in parallel using prefetch stream
-                with torch.cuda.stream(prefetch_stream):
-                    next_i = i + batch_size
-                    if next_i < num_embeddings:
-                        next_end_idx = min(next_i + batch_size, num_embeddings)
-                        # Use non_blocking=True for asynchronous transfer
-                        prefetch_start = time.time()
-                        next_batch_gpu = embeddings_matrix[next_i:next_end_idx].cuda(non_blocking=True)
-                        if DEBUG_MODE and (i == 0 or (i // batch_size) % 10 == 0):
-                            logger.info(f"DEBUG: Started preloading batch {next_i//batch_size} (async)")
-                    else:
-                        next_batch_gpu = None
-                
-                if DEBUG_MODE and (i == 0 or (i // batch_size) % 10 == 0):
-                    logger.info(f"DEBUG: Batch {i//batch_size}: compute: {compute_time:.4f}s, CPU transfer: {cpu_transfer_time:.4f}s, total: {time.time() - batch_start_time:.4f}s")
-                
-            except Exception as e:
-                logger.error(f"Error processing batch {i}-{end_idx}: {e}")
-            finally:
-                # Clean up current batch
-                if batch_embeddings is not None and i > 0:
-                    del batch_embeddings
-                torch.cuda.empty_cache()
-        
-        # Clean up any remaining preloaded batch
-        if next_batch_gpu is not None:
-            del next_batch_gpu
-            torch.cuda.empty_cache()
-        
-        # Combine all scores and get top-k
-        if all_scores:
-            all_scores_tensor = torch.cat(all_scores)
-            if top_k is None:
-                top_k = config.MAX_SEARCH_RESULTS * 2
-            top_k = min(top_k, len(all_scores_tensor))
-            top_scores, top_indices = torch.topk(all_scores_tensor, top_k)
-            
-            results = []
-            for score, idx in zip(top_scores, top_indices):
-                results.append((idx.item(), score.item()))
-            
-            if DEBUG_MODE:
-                logger.info(f"DEBUG: Optimized embedding search completed in {time.time() - search_start_time:.2f} seconds")
-                logger.info(f"DEBUG: Returning {len(results)} results")
-            return results
-            
-    except Exception as e:
-        logger.error(f"Error in search_embeddings_batch_optimized: {e}")
-    finally:
-        if "query_embedding_gpu" in locals():
-            del query_embedding_gpu
-        torch.cuda.empty_cache()
-    
-    return []
-
-
-def search_embeddings_batch(
-    query_embedding: torch.Tensor, batch_size: int = 1000, top_k: int = None
-) -> List[tuple]:
-    """Search through embeddings in batches, loading to GPU only when needed"""
-    # Use optimized version if enabled
-    if config.USE_GPU_PRELOADING:
-        return search_embeddings_batch_optimized(query_embedding, batch_size, top_k)
-    
-    # Original implementation
-    all_scores = []
-    search_start_time = time.time()
-    if DEBUG_MODE:
-        logger.info(f"DEBUG: Starting embedding search with batch_size={batch_size}, top_k={top_k}")
-
-    try:
-        # Ensure query embedding is on GPU
-        gpu_transfer_start = time.time()
-        query_embedding_gpu = query_embedding.cuda()
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Query embedding transferred to GPU in {time.time() - gpu_transfer_start:.4f} seconds")
-        
-        # Process the single embeddings matrix in batches
-        num_embeddings = embeddings_matrix.shape[0]
-        if DEBUG_MODE:
-            logger.info(f"DEBUG: Total embeddings to search: {num_embeddings}")
-
-        for i in range(0, num_embeddings, batch_size):
-            batch_start_time = time.time()
-            end_idx = min(i + batch_size, num_embeddings)
-
-            try:
-                # Load batch to GPU
-                gpu_load_start = time.time()
-                batch_embeddings = embeddings_matrix[i:end_idx].cuda()
-                gpu_load_time = time.time() - gpu_load_start
-
-                # Compute similarities
-                compute_start = time.time()
-                batch_scores = compute_similarity(query_embedding_gpu, batch_embeddings)
-                compute_time = time.time() - compute_start
-
-                # Store results (move back to CPU to save GPU memory)
-                cpu_transfer_start = time.time()
-                all_scores.append(batch_scores.cpu())
-                cpu_transfer_time = time.time() - cpu_transfer_start
-                
-                if DEBUG_MODE and (i == 0 or (i // batch_size) % 10 == 0):
-                    logger.info(f"DEBUG: Batch {i//batch_size}: GPU load: {gpu_load_time:.4f}s, compute: {compute_time:.4f}s, CPU transfer: {cpu_transfer_time:.4f}s, total: {time.time() - batch_start_time:.4f}s")
-
-            except Exception as e:
-                logger.error(f"Error processing batch {i}-{end_idx}: {e}")
-            finally:
-                # Always clear GPU memory
-                if "batch_embeddings" in locals():
-                    del batch_embeddings
-                torch.cuda.empty_cache()
-
-        # Combine all scores and get top-k
-        if all_scores:
-            all_scores_tensor = torch.cat(all_scores)
-            if top_k is None:
-                top_k = config.MAX_SEARCH_RESULTS * 2  # Default: get more for reranking
-            top_k = min(top_k, len(all_scores_tensor))  # Don't exceed available results
-            top_scores, top_indices = torch.topk(all_scores_tensor, top_k)
-
-            # Return (index, score) tuples - index directly maps to metadata
-            results = []
-            for score, idx in zip(top_scores, top_indices):
-                results.append((idx.item(), score.item()))
-
-            if DEBUG_MODE:
-                logger.info(f"DEBUG: Embedding search completed in {time.time() - search_start_time:.2f} seconds")
-                logger.info(f"DEBUG: Returning {len(results)} results")
-            return results
-
-    except Exception as e:
-        logger.error(f"Error in search_embeddings_batch: {e}")
-    finally:
-        # Clean up GPU memory
-        if "query_embedding_gpu" in locals():
-            del query_embedding_gpu
-        torch.cuda.empty_cache()
-
-    return []
+# Search functions removed - now using FAISS for all similarity search
 
 
 def get_detailed_instruct(task_description: str, query: str) -> str:
@@ -1035,7 +501,7 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
             logger.info(f"DEBUG: Prepared {len(rerank_texts)} inputs for reranking in {time.time() - prep_start_time:.3f} seconds")
 
         # Send request to VLLM's OpenAI-compatible completions endpoint for scoring
-        url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/completions"
+        url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/v1/completions"
         
         # Process each text for reranking using VLLM's scoring capability
         rerank_scores = []

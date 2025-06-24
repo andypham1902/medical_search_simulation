@@ -2,7 +2,6 @@
 FAISS Index Manager for Medical Search Simulation
 Handles FAISS multi-GPU index creation, loading, and searching
 """
-
 import faiss
 import numpy as np
 import torch
@@ -56,8 +55,8 @@ class FaissIndexManager:
                 index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_INNER_PRODUCT)
             elif index_type == "IVFPQ":
                 quantizer = faiss.IndexFlatIP(self.embedding_dimension)
-                # Use 64 subvectors with 8 bits each (PQ64x8)
-                m = 64  # number of subvectors
+                # Use 32 subvectors with 8 bits each (PQ32x8) to fit GPU shared memory constraints
+                m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
                 nbits = 8  # bits per subvector
                 index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_INNER_PRODUCT)
             else:
@@ -71,8 +70,9 @@ class FaissIndexManager:
                 index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_L2)
             elif index_type == "IVFPQ":
                 quantizer = faiss.IndexFlatL2(self.embedding_dimension)
-                m = 64
-                nbits = 8
+                # Use 32 subvectors with 8 bits each (PQ32x8) to fit GPU shared memory constraints
+                m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
+                nbits = 8  # bits per subvector
                 index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_L2)
             else:
                 raise ValueError(f"Unsupported index type: {index_type}")
@@ -202,6 +202,135 @@ class FaissIndexManager:
         
         return index
     
+    def build_index_incremental(self,
+                               embedding_folder: str,
+                               max_files: int = 3205,
+                               index_type: str = "IVFFlat",
+                               nlist: int = 1024,
+                               use_cosine: bool = True,
+                               batch_size: int = 50,
+                               training_samples_per_file: int = 128) -> faiss.Index:
+        """
+        Build FAISS index incrementally by loading embeddings in batches
+        This avoids loading all embeddings into memory at once
+        
+        Args:
+            embedding_folder: Path to folder containing embedding files
+            max_files: Maximum number of files to load
+            index_type: Type of FAISS index
+            nlist: Number of clusters for IVF indexes
+            use_cosine: Whether to use cosine similarity
+            batch_size: Number of files to process at once
+            training_samples_per_file: Number of samples to collect per file for training
+            
+        Returns:
+            Trained FAISS index
+        """
+        logger.info(f"Building {index_type} index incrementally from {max_files} files...")
+        start_time = time.time()
+        
+        # Create the index
+        index = self.create_index(index_type, nlist, use_cosine)
+        
+        # For IVF indexes, we need to train first
+        if index_type in ["IVFFlat", "IVFPQ"]:
+            logger.info("Collecting training samples...")
+            training_data = []
+            
+            # Collect training samples from a subset of files
+            num_training_files = min(100, max_files)  # Use first 100 files for training
+            for i in range(0, num_training_files, 10):  # Sample every 10th file
+                file_path = os.path.join(embedding_folder, f"embeddings_{i}.pt")
+                try:
+                    embeddings = torch.load(file_path, map_location="cpu")
+                    if embeddings.dim() == 1:
+                        embeddings = embeddings.unsqueeze(0)
+                    
+                    # Convert to numpy
+                    embeddings_np = embeddings.numpy().astype(np.float32)
+                    
+                    # Normalize if using cosine
+                    if use_cosine:
+                        norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
+                        norms[norms == 0] = 1
+                        embeddings_np = embeddings_np / norms
+                    
+                    # Sample some vectors for training
+                    n_samples = min(training_samples_per_file, len(embeddings_np))
+                    indices = np.random.choice(len(embeddings_np), n_samples, replace=False)
+                    training_data.append(embeddings_np[indices])
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to load training samples from {file_path}: {e}")
+            
+            if training_data:
+                training_data = np.vstack(training_data)
+                logger.info(f"Training index with {len(training_data)} samples...")
+                index.train(training_data)
+                logger.info("Index training completed")
+                # Clear training data to free memory
+                del training_data
+            else:
+                logger.warning("No training data collected, index may not perform well")
+        
+        # Load and add embeddings in batches
+        logger.info("Adding embeddings to index in batches...")
+        total_added = 0
+        
+        def load_and_process_file(file_idx: int) -> Tuple[int, Optional[np.ndarray]]:
+            """Load a single embedding file and convert to numpy"""
+            file_path = os.path.join(embedding_folder, f"embeddings_{file_idx}.pt")
+            try:
+                embeddings = torch.load(file_path, map_location="cpu")
+                if embeddings.dim() == 1:
+                    embeddings = embeddings.unsqueeze(0)
+                
+                # Convert to numpy
+                embeddings_np = embeddings.numpy().astype(np.float32)
+                
+                # Normalize if using cosine
+                if use_cosine:
+                    norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
+                    norms[norms == 0] = 1
+                    embeddings_np = embeddings_np / norms
+                
+                return file_idx, embeddings_np
+            except Exception as e:
+                logger.warning(f"Failed to load {file_path}: {e}")
+                return file_idx, None
+        
+        # Process files in batches
+        for batch_start in range(0, max_files, batch_size):
+            batch_end = min(batch_start + batch_size, max_files)
+            logger.info(f"Processing embedding batch {batch_start}-{batch_end-1}")
+            
+            # Load files in parallel
+            batch_embeddings = []
+            with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
+                futures = [executor.submit(load_and_process_file, i) 
+                          for i in range(batch_start, batch_end)]
+                
+                for future in futures:
+                    file_idx, embeddings_np = future.result()
+                    if embeddings_np is not None:
+                        batch_embeddings.append(embeddings_np)
+            
+            # Add batch to index
+            if batch_embeddings:
+                batch_matrix = np.vstack(batch_embeddings)
+                index.add(batch_matrix)
+                total_added += len(batch_matrix)
+                logger.info(f"Added {len(batch_matrix)} vectors (total: {total_added})")
+                
+                # Clear batch to free memory
+                del batch_embeddings
+                del batch_matrix
+        
+        logger.info(f"Incremental index build completed in {time.time() - start_time:.2f}s")
+        logger.info(f"Index statistics: {index.ntotal} vectors")
+        
+        return index
+    
     def setup_multi_gpu_index(self, 
                              cpu_index: faiss.Index,
                              gpu_devices: Optional[List[int]] = None) -> faiss.Index:
@@ -239,7 +368,7 @@ class FaissIndexManager:
             gpu_index = faiss.index_cpu_to_gpu(gpu_resources[0], gpu_devices[0], cpu_index)
         else:
             # Multi-GPU using sharding
-            gpu_index = faiss.index_cpu_to_all_gpus(cpu_index, co=None, gpu_ids=gpu_devices)
+            gpu_index = faiss.index_cpu_to_gpus_list(cpu_index, co=None, gpus=gpu_devices)
         
         logger.info(f"Multi-GPU index setup complete on {len(gpu_devices)} GPUs")
         return gpu_index
@@ -299,6 +428,53 @@ class FaissIndexManager:
             distances, indices = self.gpu_index.search(query_embeddings, k)
         
         return distances, indices
+    
+    def setup_index_incremental(self,
+                               embedding_folder: str,
+                               max_files: int,
+                               index_type: str = "IVFFlat",
+                               nlist: int = 1024,
+                               use_cosine: bool = True,
+                               gpu_devices: Optional[List[int]] = None,
+                               save_path: Optional[str] = None,
+                               load_path: Optional[str] = None) -> None:
+        """
+        Setup index incrementally from embedding files
+        
+        Args:
+            embedding_folder: Path to folder containing embedding files
+            max_files: Maximum number of files to load
+            index_type: Type of FAISS index
+            nlist: Number of clusters for IVF
+            use_cosine: Whether to use cosine similarity
+            gpu_devices: GPU devices to use
+            save_path: Path to save the built index
+            load_path: Path to load existing index (skips building)
+        """
+        logger.info("Starting incremental FAISS index setup...")
+        
+        if load_path and os.path.exists(load_path):
+            # Load existing index
+            logger.info(f"Loading existing index from {load_path}")
+            self.cpu_index = self.load_index(load_path)
+        else:
+            # Build new index incrementally
+            self.cpu_index = self.build_index_incremental(
+                embedding_folder=embedding_folder,
+                max_files=max_files,
+                index_type=index_type,
+                nlist=nlist,
+                use_cosine=use_cosine
+            )
+            
+            # Save index if requested
+            if save_path:
+                self.save_index(self.cpu_index, save_path)
+        
+        # Setup multi-GPU index
+        if gpu_devices is not None and len(gpu_devices) > 0:
+            self.gpu_index = self.setup_multi_gpu_index(self.cpu_index, gpu_devices)
+            logger.info("Multi-GPU index setup completed")
     
     def setup_index_from_embeddings(self,
                                    embeddings: np.ndarray,
