@@ -7,10 +7,11 @@ A high-performance medical literature search system that uses embedding-based se
 - **FAISS Multi-GPU Search**: Scalable similarity search across multiple GPUs using FAISS
 - **Fast Semantic Search**: Utilizes Qwen3-Embedding-8B for generating high-quality document embeddings
 - **Advanced Reranking**: Optional reranking with Qwen3-Reranker-8B for improved relevance
-- **GPU Load Balancing**: Distributes embeddings across all available GPUs to eliminate bottlenecks
-- **Memory Optimization**: INT4/INT8/FP16 quantization reduces memory usage by up to 8x
+- **GPU Load Balancing**: Distributes FAISS index shards across all available GPUs to eliminate bottlenecks
+- **Built-in FAISS Quantization**: IVFPQ index type provides automatic vector quantization (PQ32x8)
 - **Multi-Server Architecture**: Separate embedding and reranking servers for better resource management
 - **Index Persistence**: FAISS indexes are saved/loaded for fast startup times
+- **Incremental Index Building**: Memory-efficient batch processing during index construction
 - **Deduplication**: Returns one result per paper to avoid duplicates
 - **RESTful API**: Simple and intuitive FastAPI interface with automatic documentation
 
@@ -24,22 +25,26 @@ The system consists of three main components:
 ### Data Flow
 1. User sends search query to API
 2. API gets query embedding from embedding server
-3. API performs FAISS multi-GPU similarity search on distributed embeddings
+3. API performs FAISS multi-GPU similarity search on distributed index
 4. Optionally reranks results using reranker server
 5. Returns deduplicated results (one result per paper)
 
 ### FAISS Multi-GPU Architecture
-- **Index Distribution**: Embeddings automatically distributed across all available GPUs
-- **IVFFlat Index**: Inverted File with Flat quantizer for balanced speed/accuracy
+- **Index Distribution**: FAISS index automatically sharded across all available GPUs
+- **IVFPQ Index**: Inverted File with Product Quantization for memory-efficient search
+  - 32 subvectors with 8 bits each (PQ32x8) optimized for GPU shared memory
+  - Provides built-in compression without separate quantization step
 - **Cosine Similarity**: Normalized vectors with Inner Product for optimal similarity search
 - **Index Persistence**: Pre-built indexes saved to disk for fast startup
+- **Incremental Building**: Batch-wise index construction to handle large datasets
 - **Auto-scaling**: Automatically utilizes all available GPUs (configurable)
 
 ### Memory Optimization
 - **FAISS GPU Management**: Automatic GPU memory allocation and load balancing
-- **Quantization Support**: Compatible with existing INT4/INT8/FP16 quantization
+- **Built-in Quantization**: IVFPQ index provides automatic vector compression
+- **Incremental Loading**: Embeddings loaded and processed in batches to avoid OOM
 - **Index Caching**: Pre-built FAISS indexes avoid rebuild time
-- **Memory Efficiency**: Original embeddings cleared after FAISS setup
+- **Memory Efficiency**: Original embeddings cleared immediately after index construction
 
 ## Quick Start
 
@@ -60,16 +65,46 @@ python stress_test.py --ccu 64 --duration 60
 
 ## Installation
 
+### Prerequisites
+
 1. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
+### Building FAISS-GPU from Source
+
+For optimal performance with multi-GPU support, it's recommended to build FAISS from source:
+
+```bash
+# Clone FAISS repository
+git clone https://github.com/facebookresearch/faiss
+cd faiss
+
+# Install SWIG (required for Python bindings)
+conda install -c conda-forge swig
+
+# Configure and build FAISS with GPU support
+cmake -B build -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89" .
+make -C build -j1 faiss
+make -C build -j1 swigfaiss
+
+# Install Python bindings
+cd build/faiss/python && python setup.py install
+```
+
+**Note**: 
+- Adjust `CMAKE_CUDA_ARCHITECTURES` based on your GPU architecture (e.g., "70" for V100, "80" for A100, "89" for RTX 4090)
+- The `-j1` flag builds with single thread to avoid memory issues; increase if you have sufficient RAM
+- Ensure CUDA toolkit is installed and matches your GPU driver version
+
+### Prepare Data
+
 2. Prepare embeddings:
-   - Embeddings are stored at `/path/to/embeddings/`
+   - Embeddings are stored at `/mnt/sharefs/tuenv/embeddings/`
    - Files are named `embeddings_0.pt` to `embeddings_3204.pt`
    - Each file contains embeddings for passages from medical papers
-   - Total: ~25M embeddings of dimension 4096
+   - Total: ~2.3M embeddings of dimension 4096
 
 3. Configure environment (optional):
 ```bash
@@ -119,6 +154,7 @@ python api.py --debug
 
 This will enable comprehensive logging including:
 - FAISS index setup and multi-GPU distribution times
+- FAISS incremental index building progress
 - Model loading times
 - Query embedding generation time
 - FAISS similarity search performance
@@ -280,16 +316,18 @@ RERANK_GPU_DEVICES = "1,2,3,4"
 ### Search Parameters
 ```python
 MAX_SEARCH_RESULTS = 20      # Maximum results to return
-TOP_K_RERANK = 100          # Results to rerank
+TOP_K_RERANK = 10           # Results to rerank
 EMBEDDING_DIMENSION = 4096   # Embedding vector dimension
-SEARCH_BATCH_SIZE = 65536   # Embedding search batch size
+FAISS_SEARCH_K = 1000       # Initial k for FAISS search before reranking
 ```
 
-### Quantization Settings
+### FAISS Settings
 ```python
-QUANTIZATION_TYPE = "int4"   # int4, int8, fp16, or none
-QUANTIZATION_BATCH_SIZE = 100000  # Batch size for quantization
-QUANTIZATION_BLOCK_SIZE = 64     # Block size for quantization
+FAISS_INDEX_TYPE = "IVFPQ"  # Options: "Flat", "IVFFlat", "IVFPQ"
+FAISS_NLIST = 1024          # Number of clusters for IVF indexes
+FAISS_USE_COSINE = True     # Use cosine similarity
+FAISS_GPU_DEVICES = [0, 1, 2, 3, 4, 5, 6, 7]  # GPU devices for FAISS
+FAISS_INDEX_PATH = "/mnt/sharefs/tuenv/medical_search_cache/faiss_index.bin"
 ```
 
 ### File Paths
@@ -308,17 +346,17 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 ## Performance Considerations
 
 ### Memory Requirements
-- **RAM**: ~37GB for unquantized embeddings (2.3M embeddings × 4096 dimensions)
-- **RAM with INT4**: ~5GB after quantization (8x compression)
+- **RAM**: ~37GB for raw embeddings (2.3M embeddings × 4096 dimensions × 4 bytes)
+- **RAM with FAISS IVFPQ**: ~2.3GB after Product Quantization (PQ32x8 compression)
 - **GPU**: 16GB+ VRAM recommended for both embedding and reranking models
-- **Storage**: Embeddings require ~300GB of disk space
+- **Storage**: Embeddings require ~37GB of disk space
 
 ### Optimization Tips
-1. **Use quantization**: INT4 provides 8x memory reduction with minimal quality loss
-2. **Adjust batch sizes**: Increase `SEARCH_BATCH_SIZE` for faster search if GPU memory allows
-3. **GPU allocation**: Distribute embedding and reranking servers across multiple GPUs
-4. **Disable reranking**: Use `rerank=false` for faster but less accurate results
-5. **Monitor startup time**: Initial quantization takes 2-3 minutes but is one-time cost
+1. **Use IVFPQ index**: Provides automatic vector compression with good search quality
+2. **Pre-build index**: Save built index to disk to avoid rebuild on startup
+3. **GPU allocation**: Distribute FAISS index and model servers across multiple GPUs
+4. **Disable reranking**: Use `use_reranker=false` for faster but less accurate results
+5. **Monitor startup time**: Initial index building takes 5-10 minutes but can be cached
 6. **Debug mode**: Enable to identify performance bottlenecks
 
 ## Testing
@@ -355,14 +393,14 @@ The stress test will:
 ### Common Issues
 
 1. **Out of GPU Memory**
-   - Reduce `SEARCH_BATCH_SIZE` in config
-   - Use higher quantization (INT4 vs INT8)
+   - Reduce number of GPUs in `FAISS_GPU_DEVICES`
+   - Use IVFPQ index type for built-in compression
    - Ensure no other processes are using GPU
 
 2. **Slow Startup**
-   - Loading and quantizing 3204 embedding files takes 2-3 minutes
-   - This is normal for initial startup
-   - Consider reducing `MAX_EMBEDDING_FILES` for testing
+   - Initial FAISS index building takes 5-10 minutes
+   - Pre-built indexes are loaded from disk on subsequent runs
+   - Consider using fewer embedding files for testing
 
 3. **Model Server Startup Failures**
    - Check if ports 10001 and 10002 are available
@@ -380,12 +418,13 @@ The stress test will:
 ```
 medical_search_simulation/
 ├── api.py                      # Main FastAPI application
+├── faiss_index_manager.py      # FAISS multi-GPU index management
 ├── cache_utils.py              # Caching utilities for startup
-├── config.py                  # Configuration settings
-├── quantization_utils.py      # Embedding quantization utilities
-├── vllm_generate_emb.py      # Alternative VLLM embedding generation
-├── stress_test.py            # Comprehensive stress testing tool
-├── requirements.txt          # Python dependencies
+├── config.py                   # Configuration settings
+├── preprocess.py               # Data preprocessing utilities
+├── vllm_generate_emb.py        # VLLM embedding generation
+├── stress_test.py              # Comprehensive stress testing tool
+├── requirements.txt            # Python dependencies
 ```
 
 ### Adding New Features
@@ -393,7 +432,7 @@ medical_search_simulation/
 2. Update endpoints and business logic
 3. Add corresponding tests
 4. Update configuration in `config.py` if needed
-5. Consider impact on quantization and memory usage
+5. Consider impact on FAISS index and memory usage
 
 ## License
 
