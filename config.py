@@ -69,17 +69,20 @@ RERANKER_SERVER_HOST = "127.0.0.1"
 RERANKER_SERVER_PORT = 10002
 
 # GPU allocation for separate servers
-EMBEDDING_GPU_DEVICES = "0,1,2,3"  # GPU device(s) for embedding server
-RERANK_GPU_DEVICES = "4,5,6,7"  # GPU device(s) for reranker server
+EMBEDDING_GPU_DEVICES = "0"  # GPU device(s) for embedding server
+RERANK_GPU_DEVICES = "1,2,3,4,5,6,7"  # GPU device(s) for reranker server
 
 # Model server specific configurations
-EMBEDDING_TENSOR_PARALLEL_SIZE = 4
-EMBEDDING_GPU_MEMORY_UTILIZATION = 0.8
+EMBEDDING_TENSOR_PARALLEL_SIZE = 1
+EMBEDDING_GPU_MEMORY_UTILIZATION = 0.9
 MAX_MODEL_LEN = 4096  # Maximum sequence length
 
-RERANK_TENSOR_PARALLEL_SIZE = 4
-RERANK_GPU_MEMORY_UTILIZATION = 0.8
-MAX_RERANK_LEN = 16384  # Maximum sequence length for reranker
+RERANK_TENSOR_PARALLEL_SIZE = 1
+RERANK_DATA_PARALLEL_SIZE = 7
+RERANK_GPU_MEMORY_UTILIZATION = 0.4
+MAX_RERANK_LEN = 32768  # Maximum sequence length for reranker
+RERANK_MAX_LOGPROBS = 10000
+RERANK_MAX_DOC_CHAR = 30000 # Roughly cut-off at 30k characters per document
 
 # Cache Configuration
 USE_STARTUP_CACHE = True  # Enable caching of startup data

@@ -6,7 +6,7 @@ A high-performance medical literature search system that uses embedding-based se
 
 - **FAISS Multi-GPU Search**: Scalable similarity search across multiple GPUs using FAISS
 - **Fast Semantic Search**: Utilizes Qwen3-Embedding-8B for generating high-quality document embeddings
-- **Advanced Reranking**: Optional reranking with Qwen3-Reranker-8B for improved relevance
+- **Advanced Reranking**: Yes/no classification-based reranking with Qwen3-Reranker-8B for improved relevance
 - **GPU Load Balancing**: Distributes FAISS index shards across all available GPUs to eliminate bottlenecks
 - **Built-in FAISS Quantization**: IVFPQ index type provides automatic vector quantization (PQ32x8)
 - **Multi-Server Architecture**: Separate embedding and reranking servers for better resource management
@@ -14,6 +14,7 @@ A high-performance medical literature search system that uses embedding-based se
 - **Incremental Index Building**: Memory-efficient batch processing during index construction
 - **Deduplication**: Returns one result per paper to avoid duplicates
 - **RESTful API**: Simple and intuitive FastAPI interface with automatic documentation
+- **FlashInfer Optimization**: Enhanced performance with FlashInfer-python for accelerated inference
 
 ## System Architecture
 
@@ -309,8 +310,8 @@ METADATA_DATASET_NAME = "hoanganhpham/Miriad_Pubmed_metadata"
 EMBEDDING_SERVER_PORT = 10001
 RERANKER_SERVER_PORT = 10002
 API_SERVER_PORT = 10000
-EMBEDDING_GPU_DEVICES = "0"
-RERANK_GPU_DEVICES = "1,2,3,4"
+EMBEDDING_GPU_DEVICES = "0"           # Single GPU for embedding
+RERANK_GPU_DEVICES = "1,2,3,4,5,6,7"  # Multi-GPU for reranking
 ```
 
 ### Search Parameters

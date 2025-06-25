@@ -7,3 +7,4 @@ datasets
 vllm>=0.8.5
 transformers
 accelerate
+flashinfer-python

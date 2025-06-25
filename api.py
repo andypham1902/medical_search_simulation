@@ -64,9 +64,7 @@ app = FastAPI(
     version=config.API_VERSION,
     description="A search simulation system for medical literature using embedding and reranking models",
 )
-embedding_model = None
-reranker_model = None
-reranker_tokenizer = None
+
 metadata_dataset = None
 emb_id_to_metadata_id = {}  # Maps embedding index to metadata row index
 embeddings_matrix = None  # Single concatenated matrix of all embeddings
@@ -113,25 +111,26 @@ def start_model_servers():
     )
     
     # Start reranker server using vllm serve
-    # reranker_cmd = [
-    #     sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-    #     "--model", config.RERANKER_MODEL_NAME,
-    #     "--port", str(config.RERANKER_SERVER_PORT),
-    #     "--host", config.RERANKER_SERVER_HOST,
-    #     "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
-    #     "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
-    #     "--max-model-len", str(config.MAX_RERANK_LEN),
-    #     "--trust-remote-code",
-    #     "--served-model-name", "reranker-model",
-    #     "--task", "generate",
-    # ]
-    # logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
-    # reranker_server_process = subprocess.Popen(
-    #     reranker_cmd,
-    #     stdout=subprocess.PIPE,
-    #     stderr=subprocess.PIPE,
-    #     env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
-    # )
+    reranker_cmd = [
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", config.RERANKER_MODEL_NAME,
+        "--port", str(config.RERANKER_SERVER_PORT),
+        "--host", config.RERANKER_SERVER_HOST,
+        "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
+        "--data-parallel-size", str(config.RERANK_DATA_PARALLEL_SIZE),
+        "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
+        "--max-model-len", str(config.MAX_RERANK_LEN),
+        "--trust-remote-code",
+        "--served-model-name", "reranker-model",
+        "--max_logprobs", str(config.RERANK_MAX_LOGPROBS),
+    ]
+    logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
+    reranker_server_process = subprocess.Popen(
+        reranker_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
+    )
     
     # Wait for servers to be ready using VLLM's OpenAI-compatible health endpoint
     embedding_url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health"
@@ -142,14 +141,12 @@ def start_model_servers():
         time.sleep(1)
         try:
             # Check embedding server
-            # embed_resp = requests.get(embedding_url, timeout=1)
-            # embed_ready = embed_resp.status_code == 200
-            embed_ready = True
+            embed_resp = requests.get(embedding_url, timeout=1)
+            embed_ready = embed_resp.status_code == 200
             
             # Check reranker server
-            # rerank_resp = requests.get(reranker_url, timeout=1)
-            # rerank_ready = rerank_resp.status_code == 200
-            rerank_ready = True
+            rerank_resp = requests.get(reranker_url, timeout=1)
+            rerank_ready = rerank_resp.status_code == 200
             
             if embed_ready and rerank_ready:
                 logger.info("Both VLLM servers are ready!")
@@ -266,8 +263,6 @@ async def startup_event():
         metadata_start_time = time.time()
         logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME}")
         metadata_dataset = load_dataset(config.METADATA_DATASET_NAME, split="train")
-        if DEBUG_MODE:
-            metadata_dataset = metadata_dataset.select(range(1000))  # Limit to 1000 for debugging
         
         # Only create embedding ID mapping if not loaded from cache
         if not cache_loaded:
@@ -333,8 +328,6 @@ async def startup_event():
                 # Submit all items for processing
                 futures = []
                 for idx, item in enumerate(metadata_dataset):
-                    if DEBUG_MODE and idx >= 1000:
-                        break
                     futures.append(executor.submit(process_item, item))
                 
                 # Collect results as they complete
@@ -441,9 +434,12 @@ def get_query_embedding(query: str) -> torch.Tensor:
 
 
 def format_instruction(instruction, query, doc):
+    prefix = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+    suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     output = "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}".format(
         instruction=instruction, query=query, doc=doc
     )
+    output = prefix + output.strip() + suffix
     return output
 
 
@@ -460,9 +456,8 @@ def get_passage_text(passage_id: int) -> str:
             passage_text += text
             break
     passage_text = item.get("paper_title", "").strip() + "\n" + passage_text.strip()
+    passage_text = passage_text[:config.RERANK_MAX_DOC_CHAR]  # Limit to max doc char
     return passage_text.strip()
-
-
 
 
 def softmax(x, temp=1.0):
@@ -516,25 +511,66 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
             payload = {
                 "model": "reranker-model",
                 "prompt": batch_texts,
-                "max_tokens": 1,  # We only need the score, not generation
-                "logprobs": True,
-                "echo": True,  # Include the prompt in the response for scoring
-                "temperature": 0.0
+                "max_tokens": 1,
+                "logprobs": config.RERANK_MAX_LOGPROBS,  # Request many logprobs to find yes/no tokens
+                "temperature": 0.6
             }
             
             response = requests.post(url, json=payload, timeout=60)
             response.raise_for_status()
             result = response.json()
             
-            # Extract scores from logprobs
-            for choice in result["choices"]:
-                # Get the average log probability as the relevance score
-                if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
-                    # Average log probability of the tokens (higher is better)
-                    logprobs = [lp for lp in choice["logprobs"]["token_logprobs"] if lp is not None]
-                    score = sum(logprobs) / len(logprobs) if logprobs else -100.0
+            # Extract scores from logprobs for yes/no tokens
+            for idx, choice in enumerate(result["choices"]):
+                if DEBUG_MODE and i + idx < 3:  # Log first 3 examples
+                    logger.info(f"\nDEBUG: Reranking example {i + idx + 1}:")
+                    logger.info(f"  Input prompt (first 200 chars): {batch_texts[idx][:200]}...")
+                
+                if choice.get("logprobs") and choice["logprobs"].get("top_logprobs"):
+                    # Get the first token's top logprobs
+                    if len(choice["logprobs"]["top_logprobs"]) > 0:
+                        first_token_logprobs = choice["logprobs"]["top_logprobs"][0]
+                        
+                        # Log top 5 logprobs in debug mode
+                        if DEBUG_MODE and i + idx < 3:
+                            sorted_logprobs = sorted(first_token_logprobs.items(), key=lambda x: x[1], reverse=True)[:5]
+                            logger.info(f"  Top 5 logprobs:")
+                            for token, logprob in sorted_logprobs:
+                                logger.info(f"    Token: '{token}' -> Logprob: {logprob:.4f}")
+                        
+                        # Look for yes/no tokens - check various possible formats
+                        yes_tokens = ["yes", "Yes", "YES", " yes", " Yes", " YES", "▁yes", "▁Yes"]
+                        no_tokens = ["no", "No", "NO", " no", " No", " NO", "▁no", "▁No"]
+                        
+                        # Get token IDs if available (VLLM might provide token strings directly)
+                        yes_logprob = -np.inf
+                        no_logprob = -np.inf
+                        
+                        # Search through all available logprobs
+                        for token, logprob in first_token_logprobs.items():
+                            if token in yes_tokens:
+                                yes_logprob = max(yes_logprob, logprob)
+                            elif token in no_tokens:
+                                no_logprob = max(no_logprob, logprob)
+                        
+                        # Apply softmax to get probabilities
+                        logprobs = [yes_logprob, no_logprob]
+                        probabilities = softmax(logprobs)
+                        score = probabilities[0]  # Probability of "yes"
+                        
+                        # Log yes/no logprobs and final score in debug mode
+                        if DEBUG_MODE and i + idx < 3:
+                            logger.info(f"  Yes logprob: {yes_logprob:.4f}")
+                            logger.info(f"  No logprob: {no_logprob:.4f}")
+                            logger.info(f"  Final score (P(yes)): {score:.4f}")
+                    else:
+                        score = 0.5  # Default neutral score
+                        if DEBUG_MODE and i + idx < 3:
+                            logger.info(f"  No logprobs found for first token, using default score: {score}")
                 else:
-                    score = -100.0  # Default low score if no logprobs
+                    score = 0.5  # Default neutral score if no logprobs
+                    if DEBUG_MODE and i + idx < 3:
+                        logger.info(f"  No logprobs in response, using default score: {score}")
                 rerank_scores.append(score)
         
         if DEBUG_MODE:
