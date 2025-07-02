@@ -35,13 +35,16 @@ DEBUG_MODE = config.DEBUG_MODE
 # Pydantic models for API
 class SearchRequest(BaseModel):
     query: str
-    use_reranker: bool = True  # Default to using reranker
+    use_reranker: Optional[bool] = False  # Default to using reranker
+    top_k: Optional[int] = None  # Number of search results to return (uses MAX_SEARCH_RESULTS if not specified)
+    preview_char: Optional[int] = -1  # Number of preview characters to return (-1 to skip preview generation)
 
 
 class SearchResult(BaseModel):
     url: str
     metadata: Dict[str, Any]
     score: Optional[float] = None
+    preview: str = ""  # Text preview of the most relevant chunk
 
 
 class SearchResponse(BaseModel):
@@ -96,6 +99,7 @@ def start_model_servers():
         "--port", str(config.EMBEDDING_SERVER_PORT),
         "--host", config.EMBEDDING_SERVER_HOST,
         "--tensor-parallel-size", str(config.EMBEDDING_TENSOR_PARALLEL_SIZE),
+        "--data-parallel-size", str(config.EMBEDDING_DATA_PARALLEL_SIZE),
         "--gpu-memory-utilization", str(config.EMBEDDING_GPU_MEMORY_UTILIZATION),
         "--max-model-len", str(config.MAX_MODEL_LEN),
         "--trust-remote-code",
@@ -111,26 +115,26 @@ def start_model_servers():
     )
     
     # Start reranker server using vllm serve
-    reranker_cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", config.RERANKER_MODEL_NAME,
-        "--port", str(config.RERANKER_SERVER_PORT),
-        "--host", config.RERANKER_SERVER_HOST,
-        "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
-        "--data-parallel-size", str(config.RERANK_DATA_PARALLEL_SIZE),
-        "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
-        "--max-model-len", str(config.MAX_RERANK_LEN),
-        "--trust-remote-code",
-        "--served-model-name", "reranker-model",
-        "--max_logprobs", str(config.RERANK_MAX_LOGPROBS),
-    ]
-    logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
-    reranker_server_process = subprocess.Popen(
-        reranker_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
-    )
+    # reranker_cmd = [
+    #     sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+    #     "--model", config.RERANKER_MODEL_NAME,
+    #     "--port", str(config.RERANKER_SERVER_PORT),
+    #     "--host", config.RERANKER_SERVER_HOST,
+    #     "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
+    #     "--data-parallel-size", str(config.RERANK_DATA_PARALLEL_SIZE),
+    #     "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
+    #     "--max-model-len", str(config.MAX_RERANK_LEN),
+    #     "--trust-remote-code",
+    #     "--served-model-name", "reranker-model",
+    #     "--max_logprobs", str(config.RERANK_MAX_LOGPROBS),
+    # ]
+    # logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
+    # reranker_server_process = subprocess.Popen(
+    #     reranker_cmd,
+    #     stdout=subprocess.DEVNULL,
+    #     stderr=subprocess.DEVNULL,
+    #     env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
+    # )
     
     # Wait for servers to be ready using VLLM's OpenAI-compatible health endpoint
     embedding_url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health"
@@ -145,8 +149,9 @@ def start_model_servers():
             embed_ready = embed_resp.status_code == 200
             
             # Check reranker server
-            rerank_resp = requests.get(reranker_url, timeout=1)
-            rerank_ready = rerank_resp.status_code == 200
+            # rerank_resp = requests.get(reranker_url, timeout=1)
+            # rerank_ready = rerank_resp.status_code == 200
+            rerank_ready = True
             
             if embed_ready and rerank_ready:
                 logger.info("Both VLLM servers are ready!")
@@ -433,6 +438,83 @@ def get_query_embedding(query: str) -> torch.Tensor:
         return torch.randn(config.EMBEDDING_DIMENSION)
 
 
+def get_text_embeddings_batch(texts: List[str]) -> List[torch.Tensor]:
+    """Get embeddings for a batch of text chunks using VLLM's OpenAI-compatible embedding endpoint"""
+    try:
+        start_time = time.time()
+        
+        # Prepare request using OpenAI-compatible embeddings endpoint
+        url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/v1/embeddings"
+        
+        payload = {
+            "model": "embedding-model",
+            "input": texts,  # Send list of texts for batch processing
+            "encoding_format": "float"
+        }
+        
+        # Send request to VLLM's OpenAI-compatible embeddings endpoint
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        # Extract embeddings from OpenAI-compatible response format
+        result = response.json()
+        embeddings = [torch.tensor(item["embedding"]) for item in result["data"]]
+        
+        if DEBUG_MODE:
+            logger.info(f"DEBUG: Batch embeddings generated in {time.time() - start_time:.3f} seconds for {len(texts)} texts")
+        
+        return embeddings
+    except Exception as e:
+        logger.error(f"Error generating batch embeddings: {e}")
+        # Return random embeddings as fallback
+        return [torch.randn(config.EMBEDDING_DIMENSION) for _ in texts]
+
+
+def generate_preview(passage_text: str, paper_title: str, query_embedding: torch.Tensor, preview_char: int) -> str:
+    """Generate a preview of the most relevant chunk from a passage"""
+    if preview_char <= 0:
+        return ""
+    preview_char = max(preview_char, config.MINIMUM_PREVIEW_CHAR)
+    try:
+        # Split passage into chunks of preview_char size (no overlap)
+        chunks = []
+        chunk_texts = []
+        
+        for i in range(0, len(passage_text), preview_char):
+            chunk = passage_text[i:i + preview_char]
+            if len(chunk.strip()) > 10:  # Skip too short chunks
+                chunks.append(chunk)
+                # Format as title + chunk for embedding
+                chunk_text = f"{paper_title}\n{chunk}"
+                chunk_texts.append(chunk_text)
+        
+        if not chunks:
+            return ""
+        
+        # If only one chunk, return it
+        if len(chunks) == 1:
+            return chunks[0]
+        
+        # Get embeddings for all chunks in batch
+        chunk_embeddings = get_text_embeddings_batch(chunk_texts)
+        
+        # Convert to tensor for similarity computation
+        chunk_embeddings_tensor = torch.stack(chunk_embeddings)
+        
+        # Compute similarities with query embedding
+        similarities = compute_similarity(query_embedding, chunk_embeddings_tensor)
+        
+        # Find the chunk with highest similarity
+        best_idx = torch.argmax(similarities).item()
+        
+        return chunks[best_idx]
+        
+    except Exception as e:
+        logger.error(f"Error generating preview: {e}")
+        # Fallback: return first preview_char characters
+        return passage_text[:preview_char]
+
+
 def format_instruction(instruction, query, doc):
     prefix = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
     suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -602,10 +684,15 @@ async def search(request: SearchRequest):
 
     Args:
         query: The search query text
-        use_reranker: Whether to apply reranking model (default: True)
+        use_reranker: Whether to apply reranking model (default: False)
+        top_k: Number of search results to return (optional, defaults to MAX_SEARCH_RESULTS from config)
+        preview_char: Number of preview characters to return for each result (-1 to skip preview generation)
+                     Must be at least MINIMUM_PREVIEW_CHAR if specified
 
     Returns:
         A list of URLs with metadata, optionally reranked for relevance.
+        Results are limited to min(top_k, MAX_SEARCH_RESULTS) when top_k is specified.
+        Each result includes a preview of the most relevant chunk if preview_char is specified.
     """
     try:
         search_start_time = time.time()
@@ -628,13 +715,13 @@ async def search(request: SearchRequest):
 
         # Search through embeddings to find similar documents
         logger.info("Searching through embeddings...")
-        # Get more candidates if using reranker to account for deduplication
-        num_candidates = (
-            config.MAX_SEARCH_RESULTS * 20
-            if request.use_reranker
-            else config.MAX_SEARCH_RESULTS * 2
-        )
         
+        num_candidates = (
+            config.MAX_SEARCH_RESULTS * 4
+            if request.use_reranker
+            else int (config.MAX_SEARCH_RESULTS * 1.2 )
+        ) # Get more candidates if using reranker to account for deduplication
+
         search_start = time.time()
         # Use FAISS multi-GPU search
         logger.info("Using FAISS multi-GPU search...")
@@ -645,6 +732,7 @@ async def search(request: SearchRequest):
         )
         # Convert FAISS results to the expected format: list of (index, score) tuples
         top_matches = [(indices[0][i], float(distances[0][i])) for i in range(len(indices[0]))]
+        
         if DEBUG_MODE:
             logger.info(f"DEBUG: Embedding search completed in {time.time() - search_start:.3f} seconds, found {len(top_matches)} matches")
 
@@ -684,10 +772,20 @@ async def search(request: SearchRequest):
 
         # Get metadata for deduplicated matches
         search_results = []
-        for idx, score in deduplicated_matches[: config.MAX_SEARCH_RESULTS]:
+        # Use custom top_k if provided, but cap at MAX_SEARCH_RESULTS
+        max_results = min(request.top_k, config.MAX_SEARCH_RESULTS) if request.top_k is not None else config.MAX_SEARCH_RESULTS
+        for idx, score in deduplicated_matches[: max_results]:
             metadata_id = emb_id_to_metadata_id.get(idx)
             if metadata_id is not None and metadata_id < len(metadata_dataset):
                 item = metadata_dataset[metadata_id]
+                
+                # Generate preview if requested
+                preview = ""
+                if request.preview_char is not None and request.preview_char != -1:
+                    # Get the passage text for this specific passage
+                    passage_text = get_passage_text(idx)
+                    paper_title = item.get("paper_title", "Unknown Title")
+                    preview = generate_preview(passage_text, paper_title, query_embedding, request.preview_char)
 
                 result = SearchResult(
                     url=item.get("paper_url", f"https://example.com/paper_{paper_id}"),
@@ -699,6 +797,7 @@ async def search(request: SearchRequest):
                         "specialty": item.get("specialty", []),
                     },
                     score=score,
+                    preview=preview
                 )
                 search_results.append(result)
 

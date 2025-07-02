@@ -7,7 +7,7 @@ import os
 # Model Configuration
 EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
 RERANKER_MODEL_NAME = "Qwen/Qwen3-Reranker-8B"
-METADATA_DATASET_NAME = "hoanganhpham/Miriad_Pubmed_metadata"
+METADATA_DATASET_NAME = "hoanganhpham/Wiki_metadata"
 
 # VLLM Configuration
 TRUST_REMOTE_CODE = True
@@ -15,7 +15,7 @@ TRUST_REMOTE_CODE = True
 # API Configuration
 API_HOST = "0.0.0.0"
 API_PORT = 10000
-API_TITLE = "Medical Search Simulation API"
+API_TITLE = "Wiki Search Simulation API"
 API_VERSION = "1.0.0"
 
 # Search Configuration
@@ -25,13 +25,14 @@ EMBEDDING_DIMENSION = 4096  # Adjust based on actual model dimension
 BATCH_SIZE = 65536  # Batch size for GPU processing during search
 USE_GPU_PRELOADING = True  # Enable GPU preloading for better pipeline efficiency
 PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
+MINIMUM_PREVIEW_CHAR = 256  # Minimum preview character length
 
 # FAISS Configuration
 FAISS_INDEX_TYPE = "IVFPQ"  # Options: "Flat", "IVFFlat", "IVFPQ" (IVFPQ provides built-in quantization)
 FAISS_NLIST = 1024  # Number of clusters for IVF indexes
 FAISS_USE_COSINE = True  # Use cosine similarity (normalized vectors with IP)
 FAISS_GPU_DEVICES = [0, 1, 2, 3, 4, 5, 6, 7]  # GPU devices for FAISS
-FAISS_INDEX_PATH = "/mnt/sharefs/tuenv/medical_search_cache/faiss_index.bin"  # Path to save/load FAISS index
+FAISS_INDEX_PATH = "/mnt/sharefs/tuenv/wiki_search_cache/faiss_index.bin"  # Path to save/load FAISS index
 FAISS_SEARCH_K = 1000  # Initial k for FAISS search before reranking
 
 # Note: Quantization is now handled by FAISS internally (IVFPQ index type)
@@ -41,9 +42,11 @@ MAX_LOGPROBS = 8192  # Maximum number of log probabilities to return
 RERANK_BATCH_SIZE = 32  # Batch size for reranking
 
 # File Paths
-EMBEDDING_FOLDER = "/mnt/sharefs/tuenv/embeddings/"
-MAX_EMBEDDING_FILES = 3205  # Define correctly number of emb files
-
+EMBEDDING_FOLDER = "/mnt/sharefs/tuenv/wiki_embeddings/"
+# MAX_EMBEDDING_FILES = 3205  # Define correctly number of emb files
+# 0 -> 281: Miriad, 282 -> 3204: Pubmed, 3205 ->: Taxonomy
+MAX_EMBEDDING_FILES = 785
+# 0 -> 785: Wiki EN
 # Logging Configuration
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -69,11 +72,12 @@ RERANKER_SERVER_HOST = "127.0.0.1"
 RERANKER_SERVER_PORT = 10002
 
 # GPU allocation for separate servers
-EMBEDDING_GPU_DEVICES = "0"  # GPU device(s) for embedding server
+EMBEDDING_GPU_DEVICES = "0,1,2,3,4,5,6,7"  # GPU device(s) for embedding server
 RERANK_GPU_DEVICES = "1,2,3,4,5,6,7"  # GPU device(s) for reranker server
 
 # Model server specific configurations
-EMBEDDING_TENSOR_PARALLEL_SIZE = 1
+EMBEDDING_TENSOR_PARALLEL_SIZE = 8
+EMBEDDING_DATA_PARALLEL_SIZE = 1
 EMBEDDING_GPU_MEMORY_UTILIZATION = 0.9
 MAX_MODEL_LEN = 4096  # Maximum sequence length
 
@@ -86,5 +90,5 @@ RERANK_MAX_DOC_CHAR = 30000 # Roughly cut-off at 30k characters per document
 
 # Cache Configuration
 USE_STARTUP_CACHE = True  # Enable caching of startup data
-CACHE_DIR = "/mnt/sharefs/tuenv/medical_search_cache"  # Directory for cache files
+CACHE_DIR = "/mnt/sharefs/tuenv/wiki_search_cache"  # Directory for cache files
 FORCE_CACHE_REBUILD = False  # Force rebuilding cache even if valid

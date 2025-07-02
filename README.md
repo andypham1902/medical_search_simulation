@@ -15,6 +15,8 @@ A high-performance medical literature search system that uses embedding-based se
 - **Deduplication**: Returns one result per paper to avoid duplicates
 - **RESTful API**: Simple and intuitive FastAPI interface with automatic documentation
 - **FlashInfer Optimization**: Enhanced performance with FlashInfer-python for accelerated inference
+- **Customizable Results**: Control number of results with top_k parameter
+- **Smart Previews**: Generate relevant text previews showing the most pertinent passage chunks
 
 ## System Architecture
 
@@ -136,7 +138,7 @@ curl http://localhost:10000/health
 ```bash
 curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
-  -d '{"query": "diabetes treatment", "use_reranker": true}'
+  -d '{"query": "diabetes treatment", "use_reranker": true, "top_k": 10, "preview_char": 300}'
 ```
 
 3. **Visit a specific document** (replace URL with one from search results):
@@ -179,13 +181,17 @@ POST /search
 ```json
 {
     "query": "diabetes treatment guidelines",
-    "use_reranker": true
+    "use_reranker": true,
+    "top_k": 10,
+    "preview_char": 512
 }
 ```
 
 **Parameters:**
 - `query` (required): Search query text
-- `use_reranker` (optional): Whether to apply reranking (default: true)
+- `use_reranker` (optional): Whether to apply reranking (default: false)
+- `top_k` (optional): Number of search results to return (default: MAX_SEARCH_RESULTS from config, max: 20)
+- `preview_char` (optional): Number of preview characters to return for each result (default: -1 to skip, min: MINIMUM_PREVIEW_CHAR)
 
 **Example curl command:**
 ```bash
@@ -193,7 +199,9 @@ curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "diabetes treatment guidelines",
-    "use_reranker": true
+    "use_reranker": true,
+    "top_k": 10,
+    "preview_char": 512
   }'
 ```
 
@@ -203,7 +211,18 @@ curl -X POST "http://localhost:10000/search" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "cardiovascular risk factors",
-    "use_reranker": false
+    "use_reranker": false,
+    "top_k": 5
+  }'
+```
+
+**Example with preview generation:**
+```bash
+curl -X POST "http://localhost:10000/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "machine learning in healthcare",
+    "preview_char": 300
   }'
 ```
 
@@ -220,7 +239,8 @@ curl -X POST "http://localhost:10000/search" \
         "venue": "Nature Medicine",
         "specialty": ["endocrinology", "internal medicine"]
       },
-      "score": 0.95
+      "score": 0.95,
+      "preview": "Type 2 diabetes mellitus (T2DM) is a chronic metabolic disorder characterized by insulin resistance and relative insulin deficiency. Recent advances in diabetes management have focused on personalized treatment approaches, continuous glucose monitoring systems, and novel pharmacological interventions including GLP-1 receptor agonists..."
     }
   ]
 }
@@ -320,6 +340,7 @@ MAX_SEARCH_RESULTS = 20      # Maximum results to return
 TOP_K_RERANK = 10           # Results to rerank
 EMBEDDING_DIMENSION = 4096   # Embedding vector dimension
 FAISS_SEARCH_K = 1000       # Initial k for FAISS search before reranking
+MINIMUM_PREVIEW_CHAR = 100   # Minimum preview character length
 ```
 
 ### FAISS Settings
