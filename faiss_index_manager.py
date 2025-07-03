@@ -209,7 +209,7 @@ class FaissIndexManager:
                                nlist: int = 1024,
                                use_cosine: bool = True,
                                batch_size: int = 50,
-                               training_samples_per_file: int = 128) -> faiss.Index:
+                               training_samples_per_file: int = 256) -> faiss.Index:
         """
         Build FAISS index incrementally by loading embeddings in batches
         This avoids loading all embeddings into memory at once
@@ -238,8 +238,8 @@ class FaissIndexManager:
             training_data = []
             
             # Collect training samples from a subset of files
-            num_training_files = min(100, max_files)  # Use first 100 files for training
-            for i in range(0, num_training_files, 10):  # Sample every 10th file
+            num_training_files = min(1000, max_files)  # Use first 1000 files for training
+            for i in range(0, num_training_files, 3):  # Sample every 3rd file
                 file_path = os.path.join(embedding_folder, f"embeddings_{i}.pt")
                 try:
                     embeddings = torch.load(file_path, map_location="cpu")
@@ -257,8 +257,11 @@ class FaissIndexManager:
                     
                     # Sample some vectors for training
                     n_samples = min(training_samples_per_file, len(embeddings_np))
-                    indices = np.random.choice(len(embeddings_np), n_samples, replace=False)
-                    training_data.append(embeddings_np[indices])
+                    if len(embeddings_np) > n_samples:
+                        indices = np.random.choice(len(embeddings_np), n_samples, replace=False)
+                        training_data.append(embeddings_np[indices])
+                    else:
+                        training_data.append(embeddings_np)
                     
                 except Exception as e:
                     logger.warning(f"Failed to load training samples from {file_path}: {e}")
@@ -354,21 +357,45 @@ class FaissIndexManager:
         
         logger.info(f"Setting up multi-GPU index on devices: {gpu_devices}")
         
-        # Configure GPU resources
-        gpu_resources = []
-        for gpu_id in gpu_devices:
-            res = faiss.StandardGpuResources()
-            # Set memory fraction to avoid OOM
-            res.setDefaultNullStreamAllDevices()
-            gpu_resources.append(res)
-        
         # Create multi-GPU index
         if len(gpu_devices) == 1:
             # Single GPU
-            gpu_index = faiss.index_cpu_to_gpu(gpu_resources[0], gpu_devices[0], cpu_index)
+            res = faiss.StandardGpuResources()
+            gpu_index = faiss.index_cpu_to_gpu(res, gpu_devices[0], cpu_index)
+            logger.info(f"Created single GPU index on device {gpu_devices[0]}")
         else:
-            # Multi-GPU using sharding
-            gpu_index = faiss.index_cpu_to_gpus_list(cpu_index, co=None, gpus=gpu_devices)
+            # Multi-GPU using proper FAISS API
+            # Create resources for each GPU
+            resources = [faiss.StandardGpuResources() for _ in gpu_devices]
+            
+            # Create vectors for resources and devices (required by FAISS API)
+            vres = faiss.GpuResourcesVector()
+            vdev = faiss.IntVector()
+            
+            # Add resources and device IDs to vectors
+            for gpu_id, res in zip(gpu_devices, resources):
+                vdev.push_back(gpu_id)
+                vres.push_back(res)
+                logger.info(f"Added GPU resource for device {gpu_id}")
+            
+            # Configure cloner options for sharding
+            co = faiss.GpuMultipleClonerOptions()
+            co.shard = True  # Split dataset across GPUs instead of replicating
+            co.useFloat16 = True  # Use float16 to save memory
+            co.usePrecomputed = False
+            
+            # For IVF indexes, we can share the quantizer
+            if hasattr(cpu_index, 'quantizer'):
+                co.common_ivf_quantizer = True
+                logger.info("Enabled common IVF quantizer for multi-GPU index")
+            
+            # Convert to multi-GPU index
+            gpu_index = faiss.index_cpu_to_gpu_multiple(vres, vdev, cpu_index, co)
+            
+            # Keep references to prevent garbage collection
+            gpu_index.referenced_objects = resources
+            
+            logger.info(f"Successfully created sharded multi-GPU index across devices: {gpu_devices}")
         
         logger.info(f"Multi-GPU index setup complete on {len(gpu_devices)} GPUs")
         return gpu_index
