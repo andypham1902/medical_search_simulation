@@ -99,7 +99,6 @@ def start_model_servers():
         "--port", str(config.EMBEDDING_SERVER_PORT),
         "--host", config.EMBEDDING_SERVER_HOST,
         "--tensor-parallel-size", str(config.EMBEDDING_TENSOR_PARALLEL_SIZE),
-        "--data-parallel-size", str(config.EMBEDDING_DATA_PARALLEL_SIZE),
         "--gpu-memory-utilization", str(config.EMBEDDING_GPU_MEMORY_UTILIZATION),
         "--max-model-len", str(config.MAX_MODEL_LEN),
         "--trust-remote-code",
@@ -121,7 +120,6 @@ def start_model_servers():
     #     "--port", str(config.RERANKER_SERVER_PORT),
     #     "--host", config.RERANKER_SERVER_HOST,
     #     "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
-    #     "--data-parallel-size", str(config.RERANK_DATA_PARALLEL_SIZE),
     #     "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
     #     "--max-model-len", str(config.MAX_RERANK_LEN),
     #     "--trust-remote-code",
@@ -474,6 +472,11 @@ def generate_preview(passage_text: str, paper_title: str, query_embedding: torch
     """Generate a preview of the most relevant chunk from a passage"""
     if preview_char <= 0:
         return ""
+    
+    # If passage is shorter than preview_char, return the entire passage
+    if len(passage_text) <= preview_char:
+        return passage_text
+    
     preview_char = max(preview_char, config.MINIMUM_PREVIEW_CHAR)
     try:
         # Split passage into chunks of preview_char size (no overlap)
@@ -972,6 +975,18 @@ if __name__ == "__main__":
         default=config.API_PORT,
         help="Port to bind the API server"
     )
+    parser.add_argument(
+        "--embedding-port",
+        type=int,
+        default=config.EMBEDDING_SERVER_PORT,
+        help="Port for the embedding server (overrides config)"
+    )
+    parser.add_argument(
+        "--reranking-port",
+        type=int,
+        default=config.RERANKER_SERVER_PORT,
+        help="Port for the reranking server (overrides config)"
+    )
     args = parser.parse_args()
     
     # Set debug mode
@@ -982,5 +997,11 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
         print("\n*** DEBUG MODE ENABLED - Detailed logging active ***\n")
+    
+    # Override config ports with command line arguments if provided
+    if hasattr(args, 'embedding_port') and args.embedding_port != config.EMBEDDING_SERVER_PORT:
+        config.EMBEDDING_SERVER_PORT = args.embedding_port
+    if hasattr(args, 'reranking_port') and args.reranking_port != config.RERANKER_SERVER_PORT:
+        config.RERANKER_SERVER_PORT = args.reranking_port
     
     uvicorn.run(app, host=args.host, port=args.port)
