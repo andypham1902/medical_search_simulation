@@ -17,6 +17,7 @@ import threading
 from queue import Queue
 import subprocess
 import requests
+import httpx
 import signal
 import atexit
 import sys
@@ -398,7 +399,7 @@ def get_detailed_instruct(task_description: str, query: str) -> str:
     return f"Instruct: {task_description}\nQuery:{query}"
 
 
-def get_query_embedding(query: str) -> torch.Tensor:
+async def get_query_embedding(query: str) -> torch.Tensor:
     """Get embedding for a query using VLLM's OpenAI-compatible embedding endpoint"""
     try:
         start_time = time.time()
@@ -417,8 +418,9 @@ def get_query_embedding(query: str) -> torch.Tensor:
         }
         
         # Send request to VLLM's OpenAI-compatible embeddings endpoint
-        response = requests.post(url, json=payload, timeout=60)
-        response.raise_for_status()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, timeout=60)
+            response.raise_for_status()
         
         # Extract embedding from OpenAI-compatible response format
         result = response.json()
@@ -436,7 +438,7 @@ def get_query_embedding(query: str) -> torch.Tensor:
         return torch.randn(config.EMBEDDING_DIMENSION)
 
 
-def get_text_embeddings_batch(texts: List[str]) -> List[torch.Tensor]:
+async def get_text_embeddings_batch(texts: List[str]) -> List[torch.Tensor]:
     """Get embeddings for a batch of text chunks using VLLM's OpenAI-compatible embedding endpoint"""
     try:
         start_time = time.time()
@@ -451,8 +453,9 @@ def get_text_embeddings_batch(texts: List[str]) -> List[torch.Tensor]:
         }
         
         # Send request to VLLM's OpenAI-compatible embeddings endpoint
-        response = requests.post(url, json=payload, timeout=60)
-        response.raise_for_status()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, timeout=60)
+            response.raise_for_status()
         
         # Extract embeddings from OpenAI-compatible response format
         result = response.json()
@@ -468,7 +471,7 @@ def get_text_embeddings_batch(texts: List[str]) -> List[torch.Tensor]:
         return [torch.randn(config.EMBEDDING_DIMENSION) for _ in texts]
 
 
-def generate_preview(passage_text: str, paper_title: str, query_embedding: torch.Tensor, preview_char: int) -> str:
+async def generate_preview(passage_text: str, paper_title: str, query_embedding: torch.Tensor, preview_char: int) -> str:
     """Generate a preview of the most relevant chunk from a passage"""
     if preview_char <= 0:
         return ""
@@ -499,7 +502,7 @@ def generate_preview(passage_text: str, paper_title: str, query_embedding: torch
             return chunks[0]
         
         # Get embeddings for all chunks in batch
-        chunk_embeddings = get_text_embeddings_batch(chunk_texts)
+        chunk_embeddings = await get_text_embeddings_batch(chunk_texts)
         
         # Convert to tensor for similarity computation
         chunk_embeddings_tensor = torch.stack(chunk_embeddings)
@@ -554,7 +557,7 @@ def softmax(x, temp=1.0):
     return exp_x / np.sum(exp_x)
 
 
-def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[tuple]:
+async def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[tuple]:
     """Rerank search results using the reranker server"""
     rerank_start_time = time.time()
     
@@ -589,74 +592,75 @@ def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[
         
         # Batch process for efficiency
         batch_size = config.RERANK_BATCH_SIZE
-        for i in range(0, len(rerank_texts), batch_size):
-            batch_texts = rerank_texts[i:i+batch_size]
-            
-            # Use VLLM's completions endpoint with logprobs to get scores
-            payload = {
-                "model": "reranker-model",
-                "prompt": batch_texts,
-                "max_tokens": 1,
-                "logprobs": config.RERANK_MAX_LOGPROBS,  # Request many logprobs to find yes/no tokens
-                "temperature": 0.6
-            }
-            
-            response = requests.post(url, json=payload, timeout=60)
-            response.raise_for_status()
-            result = response.json()
-            
-            # Extract scores from logprobs for yes/no tokens
-            for idx, choice in enumerate(result["choices"]):
-                if DEBUG_MODE and i + idx < 3:  # Log first 3 examples
-                    logger.info(f"\nDEBUG: Reranking example {i + idx + 1}:")
-                    logger.info(f"  Input prompt (first 200 chars): {batch_texts[idx][:200]}...")
+        async with httpx.AsyncClient() as client:
+            for i in range(0, len(rerank_texts), batch_size):
+                batch_texts = rerank_texts[i:i+batch_size]
                 
-                if choice.get("logprobs") and choice["logprobs"].get("top_logprobs"):
-                    # Get the first token's top logprobs
-                    if len(choice["logprobs"]["top_logprobs"]) > 0:
-                        first_token_logprobs = choice["logprobs"]["top_logprobs"][0]
-                        
-                        # Log top 5 logprobs in debug mode
-                        if DEBUG_MODE and i + idx < 3:
-                            sorted_logprobs = sorted(first_token_logprobs.items(), key=lambda x: x[1], reverse=True)[:5]
-                            logger.info(f"  Top 5 logprobs:")
-                            for token, logprob in sorted_logprobs:
-                                logger.info(f"    Token: '{token}' -> Logprob: {logprob:.4f}")
-                        
-                        # Look for yes/no tokens - check various possible formats
-                        yes_tokens = ["yes", "Yes", "YES", " yes", " Yes", " YES", "▁yes", "▁Yes"]
-                        no_tokens = ["no", "No", "NO", " no", " No", " NO", "▁no", "▁No"]
-                        
-                        # Get token IDs if available (VLLM might provide token strings directly)
-                        yes_logprob = -np.inf
-                        no_logprob = -np.inf
-                        
-                        # Search through all available logprobs
-                        for token, logprob in first_token_logprobs.items():
-                            if token in yes_tokens:
-                                yes_logprob = max(yes_logprob, logprob)
-                            elif token in no_tokens:
-                                no_logprob = max(no_logprob, logprob)
-                        
-                        # Apply softmax to get probabilities
-                        logprobs = [yes_logprob, no_logprob]
-                        probabilities = softmax(logprobs)
-                        score = probabilities[0]  # Probability of "yes"
-                        
-                        # Log yes/no logprobs and final score in debug mode
-                        if DEBUG_MODE and i + idx < 3:
-                            logger.info(f"  Yes logprob: {yes_logprob:.4f}")
-                            logger.info(f"  No logprob: {no_logprob:.4f}")
-                            logger.info(f"  Final score (P(yes)): {score:.4f}")
+                # Use VLLM's completions endpoint with logprobs to get scores
+                payload = {
+                    "model": "reranker-model",
+                    "prompt": batch_texts,
+                    "max_tokens": 1,
+                    "logprobs": config.RERANK_MAX_LOGPROBS,  # Request many logprobs to find yes/no tokens
+                    "temperature": 0.6
+                }
+                
+                response = await client.post(url, json=payload, timeout=60)
+                response.raise_for_status()
+                result = response.json()
+                
+                # Extract scores from logprobs for yes/no tokens
+                for idx, choice in enumerate(result["choices"]):
+                    if DEBUG_MODE and i + idx < 3:  # Log first 3 examples
+                        logger.info(f"\nDEBUG: Reranking example {i + idx + 1}:")
+                        logger.info(f"  Input prompt (first 200 chars): {batch_texts[idx][:200]}...")
+                    
+                    if choice.get("logprobs") and choice["logprobs"].get("top_logprobs"):
+                        # Get the first token's top logprobs
+                        if len(choice["logprobs"]["top_logprobs"]) > 0:
+                            first_token_logprobs = choice["logprobs"]["top_logprobs"][0]
+                            
+                            # Log top 5 logprobs in debug mode
+                            if DEBUG_MODE and i + idx < 3:
+                                sorted_logprobs = sorted(first_token_logprobs.items(), key=lambda x: x[1], reverse=True)[:5]
+                                logger.info(f"  Top 5 logprobs:")
+                                for token, logprob in sorted_logprobs:
+                                    logger.info(f"    Token: '{token}' -> Logprob: {logprob:.4f}")
+                            
+                            # Look for yes/no tokens - check various possible formats
+                            yes_tokens = ["yes", "Yes", "YES", " yes", " Yes", " YES", "▁yes", "▁Yes"]
+                            no_tokens = ["no", "No", "NO", " no", " No", " NO", "▁no", "▁No"]
+                            
+                            # Get token IDs if available (VLLM might provide token strings directly)
+                            yes_logprob = -np.inf
+                            no_logprob = -np.inf
+                            
+                            # Search through all available logprobs
+                            for token, logprob in first_token_logprobs.items():
+                                if token in yes_tokens:
+                                    yes_logprob = max(yes_logprob, logprob)
+                                elif token in no_tokens:
+                                    no_logprob = max(no_logprob, logprob)
+                            
+                            # Apply softmax to get probabilities
+                            logprobs = [yes_logprob, no_logprob]
+                            probabilities = softmax(logprobs)
+                            score = probabilities[0]  # Probability of "yes"
+                            
+                            # Log yes/no logprobs and final score in debug mode
+                            if DEBUG_MODE and i + idx < 3:
+                                logger.info(f"  Yes logprob: {yes_logprob:.4f}")
+                                logger.info(f"  No logprob: {no_logprob:.4f}")
+                                logger.info(f"  Final score (P(yes)): {score:.4f}")
+                        else:
+                            score = 0.5  # Default neutral score
+                            if DEBUG_MODE and i + idx < 3:
+                                logger.info(f"  No logprobs found for first token, using default score: {score}")
                     else:
-                        score = 0.5  # Default neutral score
+                        score = 0.5  # Default neutral score if no logprobs
                         if DEBUG_MODE and i + idx < 3:
-                            logger.info(f"  No logprobs found for first token, using default score: {score}")
-                else:
-                    score = 0.5  # Default neutral score if no logprobs
-                    if DEBUG_MODE and i + idx < 3:
-                        logger.info(f"  No logprobs in response, using default score: {score}")
-                rerank_scores.append(score)
+                            logger.info(f"  No logprobs in response, using default score: {score}")
+                    rerank_scores.append(score)
         
         if DEBUG_MODE:
             logger.info(f"DEBUG: Reranker server responded in {time.time() - generate_start_time:.3f} seconds")
@@ -712,7 +716,7 @@ async def search(request: SearchRequest):
 
         # Get query embedding
         embed_start = time.time()
-        query_embedding = get_query_embedding(query)
+        query_embedding = await get_query_embedding(query)
         if DEBUG_MODE:
             logger.info(f"DEBUG: Query embedding obtained in {time.time() - embed_start:.3f} seconds")
 
@@ -743,7 +747,7 @@ async def search(request: SearchRequest):
         if request.use_reranker:
             logger.info(f"Applying reranking to {len(top_matches)} passage results")
             rerank_start = time.time()
-            top_matches = rerank_results(query, top_matches)
+            top_matches = await rerank_results(query, top_matches)
             if DEBUG_MODE:
                 logger.info(f"DEBUG: Reranking completed in {time.time() - rerank_start:.3f} seconds")
         else:
@@ -788,7 +792,7 @@ async def search(request: SearchRequest):
                     # Get the passage text for this specific passage
                     passage_text = get_passage_text(idx)
                     paper_title = item.get("paper_title", "Unknown Title")
-                    preview = generate_preview(passage_text, paper_title, query_embedding, request.preview_char)
+                    preview = await generate_preview(passage_text, paper_title, query_embedding, request.preview_char)
 
                 result = SearchResult(
                     url=item.get("paper_url", f"https://example.com/paper_{paper_id}"),
@@ -863,23 +867,24 @@ async def health_check():
     embedding_healthy = False
     reranker_healthy = False
     
-    try:
-        embed_resp = requests.get(
-            f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health", 
-            timeout=5
-        )
-        embedding_healthy = embed_resp.status_code == 200
-    except:
-        pass
-    
-    try:
-        rerank_resp = requests.get(
-            f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/health", 
-            timeout=5
-        )
-        reranker_healthy = rerank_resp.status_code == 200
-    except:
-        pass
+    async with httpx.AsyncClient() as client:
+        try:
+            embed_resp = await client.get(
+                f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health", 
+                timeout=5
+            )
+            embedding_healthy = embed_resp.status_code == 200
+        except:
+            pass
+        
+        try:
+            rerank_resp = await client.get(
+                f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/health", 
+                timeout=5
+            )
+            reranker_healthy = rerank_resp.status_code == 200
+        except:
+            pass
     
     return {
         "status": "healthy" if embedding_healthy and reranker_healthy else "degraded",
