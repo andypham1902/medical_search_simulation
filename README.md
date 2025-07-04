@@ -17,6 +17,7 @@ A high-performance medical literature search system that uses embedding-based se
 - **FlashInfer Optimization**: Enhanced performance with FlashInfer-python for accelerated inference
 - **Customizable Results**: Control number of results with top_k parameter
 - **Smart Previews**: Generate relevant text previews showing the most pertinent passage chunks
+- **Fully Async Architecture**: Non-blocking HTTP requests using httpx for optimal performance under load
 
 ## System Architecture
 
@@ -27,10 +28,17 @@ The system consists of three main components:
 
 ### Data Flow
 1. User sends search query to API
-2. API gets query embedding from embedding server
+2. API gets query embedding from embedding server (async)
 3. API performs FAISS multi-GPU similarity search on distributed index
-4. Optionally reranks results using reranker server
+4. Optionally reranks results using reranker server (async)
 5. Returns deduplicated results (one result per paper)
+
+### Async Architecture
+- **Non-blocking HTTP**: All HTTP requests use httpx.AsyncClient for concurrent processing
+- **Async Embedding**: Query and batch embedding generation don't block the event loop
+- **Async Reranking**: Reranker requests processed asynchronously for better throughput
+- **Async Health Checks**: Server health monitoring without blocking other operations
+- **Concurrent Preview Generation**: Smart preview generation runs concurrently with other operations
 
 ### FAISS Multi-GPU Architecture
 - **Index Distribution**: FAISS index automatically sharded across all available GPUs
@@ -104,10 +112,8 @@ cd build/faiss/python && python setup.py install
 ### Prepare Data
 
 2. Prepare embeddings:
-   - Embeddings are stored at `/mnt/sharefs/tuenv/embeddings/`
-   - Files are named `embeddings_0.pt` to `embeddings_3204.pt`
-   - Each file contains embeddings for passages from medical papers
-   - Total: ~2.3M embeddings of dimension 4096
+   - Configure embedding path in `EMBEDDING_FOLDER` setting
+   - Configure number of embedding files in `MAX_EMBEDDING_FILES` setting
 
 3. Configure environment (optional):
 ```bash
@@ -354,8 +360,8 @@ FAISS_INDEX_PATH = "/mnt/sharefs/tuenv/medical_search_cache/faiss_index.bin"
 
 ### File Paths
 ```python
-EMBEDDINGS_PATH = "/mnt/sharefs/tuenv/embeddings/"
-MAX_EMBEDDING_FILES = 3204
+EMBEDDING_FOLDER = "/path/to/embeddings/"
+MAX_EMBEDDING_FILES = 785  # Adjust based on your dataset
 ```
 
 ### Debug Configuration
@@ -368,10 +374,9 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 ## Performance Considerations
 
 ### Memory Requirements
-- **RAM**: ~37GB for raw embeddings (2.3M embeddings × 4096 dimensions × 4 bytes)
-- **RAM with FAISS IVFPQ**: ~2.3GB after Product Quantization (PQ32x8 compression)
+- **RAM**: Varies based on dataset size and FAISS index type
 - **GPU**: 16GB+ VRAM recommended for both embedding and reranking models
-- **Storage**: Embeddings require ~37GB of disk space
+- **Storage**: Disk space depends on embedding dataset size
 
 ### Optimization Tips
 1. **Use IVFPQ index**: Provides automatic vector compression with good search quality
@@ -380,6 +385,7 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 4. **Disable reranking**: Use `use_reranker=false` for faster but less accurate results
 5. **Monitor startup time**: Initial index building takes 5-10 minutes but can be cached
 6. **Debug mode**: Enable to identify performance bottlenecks
+7. **Async architecture**: The fully async implementation provides better performance under concurrent load
 
 ## Testing
 
